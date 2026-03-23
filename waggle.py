@@ -133,14 +133,32 @@ def fetch_quoted_body(message_id: str, config: dict | None = None) -> str | None
 
         m.login(user, password)
 
-        # Search all folders — try INBOX first, then Sent
+        # Discover all folders and search each — handles moved messages
+        # (e.g. INBOX.Processed) without requiring a hardcoded list.
         found_uid = None
         raw_msg = None
         from_hdr = ""
         date_hdr = ""
         subj_hdr = ""
 
-        for folder in ["INBOX", '"Sent Items"', "Sent", '"INBOX.Sent"']:
+        # Build folder list: preferred order first, then everything else
+        preferred = ["INBOX", "INBOX.Processed", '"Sent Items"', "Sent"]
+        try:
+            _, folder_data = m.list()
+            all_folders = []
+            for item in folder_data or []:
+                if item:
+                    parts = item.decode() if isinstance(item, bytes) else item
+                    # Folder name is last token; may be quoted
+                    name = parts.rsplit(" ", 1)[-1].strip().strip('"')
+                    if name not in [f.strip('"') for f in preferred]:
+                        all_folders.append(name)
+        except Exception:
+            all_folders = []
+
+        search_order = preferred + all_folders
+
+        for folder in search_order:
             try:
                 status, _ = m.select(folder, readonly=True)
                 if status != "OK":
