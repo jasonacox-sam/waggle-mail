@@ -48,8 +48,13 @@ import email as email_lib
 import smtplib
 import argparse
 import logging
+import mimetypes
+from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email import encoders
 from email.utils import parseaddr, formataddr
 from urllib.parse import urlparse
 
@@ -409,6 +414,7 @@ def send_email(
     in_reply_to: str | None = None,
     references: str | None = None,
     from_name: str | None = None,
+    attachments: list | None = None,
     config: dict | None = None,
 ) -> None:
     """
@@ -485,8 +491,39 @@ def send_email(
     html_body = _md_to_html(body_md)
     html_full = _wrap_html(html_body)
 
-    msg.attach(MIMEText(plain,     "plain", "utf-8"))
-    msg.attach(MIMEText(html_full, "html",  "utf-8"))
+    if attachments:
+        # Mixed: body alternative + attachments
+        msg.attach(MIMEText(plain,     "plain", "utf-8"))
+        msg.attach(MIMEText(html_full, "html",  "utf-8"))
+        outer = MIMEMultipart("mixed")
+        outer["Subject"]  = msg["Subject"]
+        outer["From"]     = msg["From"]
+        outer["To"]       = msg["To"]
+        for key in ("Cc", "Reply-To", "In-Reply-To", "References"):
+            if msg[key]:
+                outer[key] = msg[key]
+        outer.attach(msg)
+        for path in attachments:
+            p = Path(path)
+            if not p.exists():
+                logger.warning(f"Attachment not found, skipping: {path}")
+                continue
+            ctype, _ = mimetypes.guess_type(str(p))
+            maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+            with open(p, "rb") as f:
+                data = f.read()
+            if maintype == "image":
+                part = MIMEImage(data, _subtype=subtype)
+            else:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(data)
+                encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=p.name)
+            outer.attach(part)
+        msg = outer
+    else:
+        msg.attach(MIMEText(plain,     "plain", "utf-8"))
+        msg.attach(MIMEText(html_full, "html",  "utf-8"))
 
     ctx = ssl.create_default_context()
 
@@ -531,6 +568,8 @@ def main():
     parser.add_argument("--in-reply-to", default=None,
                         help="Message-ID to reply to (enables threading + auto-quote)")
     parser.add_argument("--references",  default=None,   help="References header for threading")
+    parser.add_argument("--attach",      action="append", default=None, metavar="FILE",
+                        help="File to attach (can be specified multiple times)")
     args = parser.parse_args()
 
     send_email(
@@ -542,6 +581,7 @@ def main():
         in_reply_to=args.in_reply_to,
         references=args.references,
         from_name=args.from_name,
+        attachments=args.attach,
     )
     print(f"✅ Sent to {args.to}")
 
