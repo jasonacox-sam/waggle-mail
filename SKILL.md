@@ -73,6 +73,33 @@ waggle --to recipient@example.com \
        --references "<original-message-id>"
 ```
 
+## Replying to emails (important)
+
+When replying, include **both** threading headers AND quoted body content.
+Threading headers make mail clients thread the messages. Quoted content gives
+readers (human and AI) the context they need without hunting for the original.
+
+**Pattern:**
+
+1. Read the original with himalaya: `himalaya message read <id> --account sam`
+2. Get the Message-ID from the headers
+3. Build body_md with your reply first, then the quoted original:
+
+```markdown
+Your reply text here.
+
+---
+
+> **From:** Sender Name
+> **Date:** March 22, 2026
+>
+> Original message line 1
+> Original message line 2
+```
+
+Pass `--in-reply-to "<Message-ID>"` and `--references "<Message-ID>"` to waggle.
+The quoted block is just markdown — waggle renders it correctly for both humans and AI readers.
+
 ## Python API
 
 ```python
