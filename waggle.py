@@ -288,16 +288,38 @@ def _md_to_html_simple(text):
     html = re.sub(r"\*\*(.+?)\*\*",     r"<strong>\1</strong>", html)
     html = re.sub(r"\*(.+?)\*",         r"<em>\1</em>", html)
 
-    # Fenced code blocks
+    # Fenced code blocks — pygments inline styles if available, plain fallback
+    _pre_style = (
+        "display:block;background:#f8f8f8;color:#333;"
+        "padding:8px 12px;border-radius:3px;border:1px solid #e0e0e0;"
+        "font-family:'Courier New',Courier,monospace;font-size:12px;"
+        "white-space:pre;overflow-x:auto;margin:8px 0;"
+    )
+
     def _fence(m):
-        code = m.group(2)
-        style = (
-            "display:block;background:#f5f5f5;color:#333;"
-            "padding:8px 12px;border-radius:3px;border:1px solid #e0e0e0;"
-            "font-family:'Courier New',Courier,monospace;font-size:12px;"
-            "white-space:pre;overflow-x:auto;margin:8px 0;"
-        )
-        return f'<pre style="{style}"><code>{code}</code></pre>'
+        lang = m.group(1) or ""
+        # Un-escape HTML entities in code before highlighting
+        code_raw = m.group(2).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        try:
+            from pygments import highlight
+            from pygments.lexers import get_lexer_by_name, TextLexer
+            from pygments.formatters import HtmlFormatter
+            try:
+                lexer = get_lexer_by_name(lang) if lang else TextLexer()
+            except Exception:
+                lexer = TextLexer()
+            formatter = HtmlFormatter(
+                style="friendly",
+                noclasses=True,   # inline styles — no <head> needed
+                nowrap=True,      # no wrapping <div>, we supply the <pre>
+            )
+            highlighted = highlight(code_raw, lexer, formatter)
+            return f'<pre style="{_pre_style}">{highlighted}</pre>'
+        except ImportError:
+            # Pygments not installed — plain fallback
+            code_escaped = code_raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return f'<pre style="{_pre_style}"><code>{code_escaped}</code></pre>'
+
     html = re.sub(r"```(\w*)\n(.*?)```", _fence, html, flags=re.DOTALL)
 
     # Inline code
