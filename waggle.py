@@ -33,8 +33,38 @@ import re
 import ssl
 import smtplib
 import argparse
+import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parseaddr, formataddr
+from urllib.parse import urlparse
+
+# Set up basic logging
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Security: Header sanitization
+# ---------------------------------------------------------------------------
+
+def _sanitize_header(value: str) -> str:
+    """Remove CR/LF characters to prevent header injection."""
+    if value is None:
+        return None
+    if re.search(r'[\r\n]', str(value)):
+        raise ValueError(f"Header value contains illegal newline characters: {value!r}")
+    return str(value)
+
+
+def _validate_email(addr: str) -> str:
+    """Extract bare email address from 'Name <addr>' format."""
+    if not addr:
+        return None
+    _, email = parseaddr(addr)
+    if not email or '@' not in email:
+        raise ValueError(f"Invalid email address: {addr!r}")
+    return email
+
 
 # ---------------------------------------------------------------------------
 # Markdown → HTML
@@ -59,7 +89,8 @@ def _md_to_html_rich(text: str) -> str:
     }
     try:
         html = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Rich markdown rendering failed: {e}, falling back to simple")
         html = md_lib.markdown(text)
 
     # Add padding + monospace font to codehilite wrapper and its <pre>.
@@ -83,9 +114,23 @@ def _md_to_html_rich(text: str) -> str:
     return html
 
 
+def _escape_html(text: str) -> str:
+    """Escape HTML entities."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _validate_url(url: str) -> bool:
+    """Validate URL scheme for safe links (http/https/mailto only)."""
+    if not url:
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in ('http', 'https', 'mailto')
+
+
 def _md_to_html_simple(text: str) -> str:
     """Lightweight fallback renderer — no dependencies."""
-    html = text
+    # Escape HTML entities first
+    html = _escape_html(text)
 
     html = re.sub(r"^### (.+)$", r"<h3>\1</h3>", html, flags=re.MULTILINE)
     html = re.sub(r"^## (.+)$",  r"<h2>\1</h2>", html, flags=re.MULTILINE)
@@ -98,7 +143,8 @@ def _md_to_html_simple(text: str) -> str:
     # Fenced code blocks (``` ... ```)
     def _fence(m):
         lang = m.group(1) or ""
-        code = m.group(2).replace("<", "&lt;").replace(">", "&gt;")
+        # Content is already escaped above
+        code = m.group(2)
         style = (
             "background:#1e1e1e;color:#d4d4d4;padding:10px 14px;"
             "border-radius:4px;font-family:'SF Mono','Fira Code',Consolas,monospace;"
@@ -108,7 +154,17 @@ def _md_to_html_simple(text: str) -> str:
     html = re.sub(r"```(\w*)\n(.*?)```", _fence, html, flags=re.DOTALL)
 
     html = re.sub(r"`(.+?)`", r'<code style="background:#f4f4f4;padding:2px 5px;border-radius:3px;font-size:0.9em;">\1</code>', html)
-    html = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', html)
+    
+    # Links with validation
+    def _link(m):
+        text = m.group(1)
+        url = m.group(2).replace('&quot;', '"')
+        if not _validate_url(url):
+            return text  # Return plain text if URL is unsafe
+        url = url.replace('"', '&quot;')
+        return f'<a href="{url}" rel="noopener noreferrer">{text}</a>'
+    html = re.sub(r"\[(.+?)\]\((.+?)\)", _link, html)
+    
     html = re.sub(r"^---+$", r"<hr>", html, flags=re.MULTILINE)
 
     def _listblock(m):
@@ -213,22 +269,44 @@ def send_email(
     """
     cfg = config or {}
 
+    # Validate port
+    raw_port = cfg.get("port") or os.environ.get("WAGGLE_PORT", "465")
+    try:
+        port = int(raw_port)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid SMTP port: {raw_port!r}")
+
     host      = cfg.get("host")      or os.environ.get("WAGGLE_HOST", "localhost")
-    port      = int(cfg.get("port")  or os.environ.get("WAGGLE_PORT", 465))
     user      = cfg.get("user")      or os.environ.get("WAGGLE_USER", "")
     password  = cfg.get("password")  or os.environ.get("WAGGLE_PASS", "")
     from_addr = cfg.get("from_addr") or os.environ.get("WAGGLE_FROM", user)
     name      = from_name or cfg.get("from_name") or os.environ.get("WAGGLE_NAME", "")
     use_tls   = cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false")
 
-    from_header = f"{name} <{from_addr}>" if name else from_addr
+    # Security: Sanitize all header values
+    subject = _sanitize_header(subject)
+    to = _sanitize_header(to)
+    cc = _sanitize_header(cc)
+    reply_to = _sanitize_header(reply_to)
+    in_reply_to = _sanitize_header(in_reply_to)
+    references = _sanitize_header(references)
+    name = _sanitize_header(name)
 
+    # Use formataddr for proper RFC 5322 quoting
+    from_header = formataddr((name, from_addr)) if name else from_addr
+
+    # Extract bare addresses for SMTP envelope
+    envelope_from = _validate_email(from_addr)
+    envelope_to = [_validate_email(to)]
+    
     msg = MIMEMultipart("alternative")
     msg["Subject"]  = subject
     msg["From"]     = from_header
     msg["To"]       = to
     if cc:
         msg["Cc"]         = cc
+        for addr in cc.split(","):
+            envelope_to.append(_validate_email(addr.strip()))
     if reply_to:
         msg["Reply-To"]   = reply_to
     if in_reply_to:
@@ -243,23 +321,22 @@ def send_email(
     msg.attach(MIMEText(plain,    "plain", "utf-8"))
     msg.attach(MIMEText(html_full, "html", "utf-8"))
 
-    recipients = [to]
-    if cc:
-        recipients += [a.strip() for a in cc.split(",")]
+    # Security: Create SSL context for both TLS and STARTTLS
+    ctx = ssl.create_default_context()
 
     if use_tls:
-        ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL(host, port, context=ctx) as s:
             if user and password:
                 s.login(user, password)
-            s.sendmail(from_addr, recipients, msg.as_string())
+            s.sendmail(envelope_from, envelope_to, msg.as_string())
     else:
         with smtplib.SMTP(host, port) as s:
             s.ehlo()
-            s.starttls()
+            s.starttls(context=ctx)  # Security: Added SSL context
+            s.ehlo()
             if user and password:
                 s.login(user, password)
-            s.sendmail(from_addr, recipients, msg.as_string())
+            s.sendmail(envelope_from, envelope_to, msg.as_string())
 
 
 # ---------------------------------------------------------------------------
