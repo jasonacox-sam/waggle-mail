@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "waggle-mail"
-version = "0.2.2"
+version = "1.2.0"
 description = "Multipart email for AI agents: plain text + HTML from Markdown, auto-quoted replies via IMAP"
 readme = "README.md"
 license = {text = "MIT"}
