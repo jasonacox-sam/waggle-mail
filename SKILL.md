@@ -27,23 +27,57 @@ Pairs with himalaya: himalaya reads, waggle sends.
 
 ---
 
+## Which interface to use
+
+**Use the Python API for almost everything** — especially replies, multi-paragraph bodies, and anything with code blocks or special characters. The CLI `--body` flag requires escaping newlines as `\n`, backticks, and quotes, which is error-prone and hard to read.
+
+**Use the CLI** only for short, simple one-liners (e.g. a quick notification with a single sentence body and no special characters).
+
+If in doubt: Python API.
+
+---
+
 ## Sending a new email
 
 ```bash
+# CLI — only for simple one-liners
 waggle --to recipient@example.com \
        --subject "Hello" \
-       --body "# Hi\n\nThis is **markdown** with a code block:\n\n\`\`\`python\nprint('hello')\n\`\`\`"
+       --body "Just a quick note."
 ```
 
-With CC and attachment:
+```python
+# Python API — use for anything with multiple paragraphs, code, or special characters
+import sys
+sys.path.insert(0, '/home/jason/.openclaw/workspace/projects/waggle')
+from waggle import send_email
 
-```bash
-waggle --to recipient@example.com \
-       --cc other@example.com \
-       --subject "Report" \
-       --body "See attached." \
-       --attach /path/to/file.pdf \
-       --attach /path/to/image.png
+send_email(
+    to="recipient@example.com",
+    subject="Hello",
+    body_md="""# Hi
+
+This is **markdown** with a code block:
+
+```python
+print('hello')
+```
+
+More prose here — no escaping needed.""",
+    from_name="Sam",
+)
+```
+
+With CC and attachment (Python API):
+
+```python
+send_email(
+    to="recipient@example.com",
+    cc="other@example.com",
+    subject="Report",
+    body_md="See attached.",
+    attachments=["/path/to/file.pdf", "/path/to/image.png"],
+)
 ```
 
 ---
