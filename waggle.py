@@ -38,6 +38,11 @@ Configuration (environment variables):
     WAGGLE_NAME      Display name for From header
     WAGGLE_TLS       Use SSL/TLS (default: true; set 'false' for STARTTLS)
 
+    WAGGLE_MAILDIR   Path to a Maildir directory for local reply quoting
+                     (optional). Checked before IMAP — useful for agents
+                     receiving mail via local delivery (e.g. Cloudflare
+                     Workers, procmail, fetchmail) without an IMAP server.
+
     WAGGLE_IMAP_HOST IMAP host for auto-fetching quoted reply body (optional)
                      Defaults to WAGGLE_HOST if not set.
     WAGGLE_IMAP_PORT IMAP port (default: 993)
@@ -96,6 +101,57 @@ def _validate_email(addr):
     if not email or '@' not in email:
         raise ValueError(f"Invalid email address: {addr!r}")
     return email
+
+
+# ---------------------------------------------------------------------------
+# Maildir: Local message lookup for reply quoting
+# ---------------------------------------------------------------------------
+
+def _maildir_find_message(maildir_path, message_id):
+    """
+    Search a Maildir for a message by Message-ID header.
+
+    Looks in {maildir_path}/new/ and {maildir_path}/cur/ (standard Maildir
+    subdirectories). Uses a fast header-only scan: reads lines until the
+    first blank line (end of headers) and only parses the full message if
+    the Message-ID matches. Returns the parsed email.message.Message object
+    if found, None otherwise.
+    """
+    mid = message_id.strip()
+    if not mid.startswith("<"):
+        mid = f"<{mid}>"
+    if not mid.endswith(">"):
+        mid = f"{mid}>"
+
+    maildir = Path(maildir_path)
+    subdirs = [maildir / "new", maildir / "cur"]
+
+    for subdir in subdirs:
+        if not subdir.is_dir():
+            continue
+        for filepath in subdir.iterdir():
+            if not filepath.is_file():
+                continue
+            try:
+                # Fast path: scan headers only (up to the first blank line)
+                with open(filepath, "rb") as f:
+                    header_bytes = bytearray()
+                    for line in f:
+                        if line.strip() == b"":
+                            break
+                        header_bytes.extend(line)
+                    header_msg = email_lib.message_from_bytes(bytes(header_bytes))
+                    file_mid = (header_msg.get("Message-ID") or "").strip()
+                    if file_mid != mid:
+                        continue
+
+                # Match found — parse the full message
+                with open(filepath, "rb") as f:
+                    return email_lib.message_from_bytes(f.read())
+            except Exception:
+                continue
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -160,14 +216,19 @@ def _imap_find_uid(m, mid):
 
 def fetch_quoted_body(message_id, config=None):
     """
-    Fetch the original message from IMAP and return (quoted_plain, quoted_html).
+    Fetch the original message and return (quoted_plain, quoted_html).
+
+    Lookup order:
+    1. Maildir (if configured via config["maildir_path"] or WAGGLE_MAILDIR)
+    2. IMAP   (if configured via WAGGLE_IMAP_HOST or WAGGLE_HOST)
+
+    If Maildir is configured and the message is found there, IMAP is skipped
+    entirely. If Maildir is configured but the message isn't found, falls
+    through to IMAP. Returns (None, None) if neither source has the message.
 
     Outlook-style quoting:
     - plain: full body under -----Original Message----- attribution header (snowballs naturally)
     - html:  original email HTML wrapped in a <div> blockquote (snowballs naturally)
-
-    Searches all folders so it works after the original is moved to INBOX.Processed.
-    Returns (None, None) if IMAP is not configured or message not found.
     """
     from email.header import decode_header, make_header
 
@@ -179,91 +240,110 @@ def fetch_quoted_body(message_id, config=None):
     if not mid.endswith(">"):
         mid = f"{mid}>"
 
-    try:
-        m, _ = _imap_connect(cfg)
-        if m is None:
-            return None, None
+    msg = None
 
-        folder, uid = _imap_find_uid(m, mid)
-        if not uid:
+    # --- Try Maildir first ---
+    maildir_path = cfg.get("maildir_path") or os.environ.get("WAGGLE_MAILDIR", "")
+    if maildir_path:
+        try:
+            msg = _maildir_find_message(maildir_path, mid)
+            if msg:
+                logger.debug(f"Found message {mid} in Maildir: {maildir_path}")
+        except Exception as e:
+            logger.warning(f"Maildir lookup failed: {e}")
+
+    # --- Fall back to IMAP ---
+    if msg is None:
+        try:
+            m, _ = _imap_connect(cfg)
+            if m is None:
+                if not maildir_path:
+                    return None, None
+                # Maildir was configured but message not found, no IMAP either
+                return None, None
+
+            folder, uid = _imap_find_uid(m, mid)
+            if not uid:
+                m.logout()
+                return None, None
+
+            # Re-select the folder (find may have left us somewhere else)
+            m.select(folder, readonly=True)
+            typ, data = m.fetch(uid, "(BODY.PEEK[])")
             m.logout()
+
+            if typ != "OK" or not data or data[0] is None:
+                return None, None
+
+            msg = email_lib.message_from_bytes(data[0][1])
+        except Exception as e:
+            logger.warning(f"IMAP quote fetch failed: {e}")
             return None, None
 
-        # Re-select the folder (find may have left us somewhere else)
-        m.select(folder, readonly=True)
-        typ, data = m.fetch(uid, "(BODY.PEEK[])")
-        m.logout()
-
-        if typ != "OK" or not data or data[0] is None:
-            return None, None
-
-        msg = email_lib.message_from_bytes(data[0][1])
-
-        from_hdr = str(make_header(decode_header(msg.get("From", "")  or "")))
-        date_hdr = str(make_header(decode_header(msg.get("Date", "")  or "")))
-        subj_hdr = str(make_header(decode_header(msg.get("Subject", "") or "")))
-
-        plain_body = html_body = None
-        if msg.is_multipart():
-            for part in msg.walk():
-                ct = part.get_content_type()
-                cd = str(part.get("Content-Disposition", ""))
-                if "attachment" in cd:
-                    continue
-                if ct == "text/plain" and plain_body is None:
-                    p = part.get_payload(decode=True)
-                    if p:
-                        plain_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
-                elif ct == "text/html" and html_body is None:
-                    p = part.get_payload(decode=True)
-                    if p:
-                        html_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
-        else:
-            p = msg.get_payload(decode=True)
-            if p:
-                plain_body = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
-
-        # --- Plain text quoted block (Outlook style, full body, no trimming) ---
-        attr_plain = (
-            f"-----Original Message-----\n"
-            f"From: {from_hdr}\n"
-            f"Sent: {date_hdr}\n"
-            f"Subject: {subj_hdr}"
-        )
-        if plain_body:
-            quoted_plain = f"\n\n{attr_plain}\n\n{plain_body.strip()}"
-        else:
-            quoted_plain = f"\n\n{attr_plain}"
-
-        # --- HTML quoted block (Outlook-style left-border blockquote) ---
-        attr_html = (
-            f'<p style="margin:0 0 8px 0;font-size:12px;color:#777;">'
-            f'<b>From:</b> {from_hdr}<br>'
-            f'<b>Sent:</b> {date_hdr}<br>'
-            f'<b>Subject:</b> {subj_hdr}'
-            f'</p>'
-        )
-        if html_body:
-            inner = html_body
-        elif plain_body:
-            safe = plain_body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            inner = f'<pre style="font-family:inherit;white-space:pre-wrap;margin:0;">{safe}</pre>'
-        else:
-            inner = "<p><em>(original message unavailable)</em></p>"
-
-        quoted_html = (
-            f'<div style="border-left:2px solid #ccc;padding-left:12px;'
-            f'margin-top:16px;color:#555;">'
-            f'{attr_html}'
-            f'{inner}'
-            f'</div>'
-        )
-
-        return quoted_plain, quoted_html
-
-    except Exception as e:
-        logger.warning(f"IMAP quote fetch failed: {e}")
+    if msg is None:
         return None, None
+
+    from_hdr = str(make_header(decode_header(msg.get("From", "")  or "")))
+    date_hdr = str(make_header(decode_header(msg.get("Date", "")  or "")))
+    subj_hdr = str(make_header(decode_header(msg.get("Subject", "") or "")))
+
+    plain_body = html_body = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            if "attachment" in cd:
+                continue
+            if ct == "text/plain" and plain_body is None:
+                p = part.get_payload(decode=True)
+                if p:
+                    plain_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+            elif ct == "text/html" and html_body is None:
+                p = part.get_payload(decode=True)
+                if p:
+                    html_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+    else:
+        p = msg.get_payload(decode=True)
+        if p:
+            plain_body = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+
+    # --- Plain text quoted block (Outlook style, full body, no trimming) ---
+    attr_plain = (
+        f"-----Original Message-----\n"
+        f"From: {from_hdr}\n"
+        f"Sent: {date_hdr}\n"
+        f"Subject: {subj_hdr}"
+    )
+    if plain_body:
+        quoted_plain = f"\n\n{attr_plain}\n\n{plain_body.strip()}"
+    else:
+        quoted_plain = f"\n\n{attr_plain}"
+
+    # --- HTML quoted block (Outlook-style left-border blockquote) ---
+    attr_html = (
+        f'<p style="margin:0 0 8px 0;font-size:12px;color:#777;">'
+        f'<b>From:</b> {from_hdr}<br>'
+        f'<b>Sent:</b> {date_hdr}<br>'
+        f'<b>Subject:</b> {subj_hdr}'
+        f'</p>'
+    )
+    if html_body:
+        inner = html_body
+    elif plain_body:
+        safe = plain_body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        inner = f'<pre style="font-family:inherit;white-space:pre-wrap;margin:0;">{safe}</pre>'
+    else:
+        inner = "<p><em>(original message unavailable)</em></p>"
+
+    quoted_html = (
+        f'<div style="border-left:2px solid #ccc;padding-left:12px;'
+        f'margin-top:16px;color:#555;">'
+        f'{attr_html}'
+        f'{inner}'
+        f'</div>'
+    )
+
+    return quoted_plain, quoted_html
 
 
 # ---------------------------------------------------------------------------

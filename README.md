@@ -50,6 +50,22 @@ export WAGGLE_NAME="Your Name"       # optional display name
 export WAGGLE_TLS=true               # false for STARTTLS
 ```
 
+### Maildir (optional — local reply quoting without IMAP)
+
+```bash
+export WAGGLE_MAILDIR=/home/agent/mail   # path to a Maildir directory
+```
+
+When set, waggle searches the local Maildir (`new/` and `cur/` subdirectories)
+for the original message before attempting IMAP. This is useful for agents that
+receive mail via local delivery — Cloudflare Workers, procmail, fetchmail, or
+any pipeline that writes to Maildir format — and don't run an IMAP server.
+
+If the message is found in Maildir, IMAP is skipped entirely. If not found,
+waggle falls through to IMAP (if configured). You can use both together.
+
+Or pass `maildir_path` in the `config` dict to `send_email()`.
+
 ### IMAP (optional — enables automatic reply quoting)
 
 ```bash
