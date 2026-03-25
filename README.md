@@ -186,6 +186,14 @@ Plain text body is **raw Markdown** — AI agents reading with himalaya or simil
 
 ---
 
+## Example Output
+
+The screenshot below shows `waggle` v1.7.2 rendering a formatting showcase email in Outlook (dark mode) — headings, paragraphs, bullet and numbered lists, blockquote, code block, and inline formatting, all generated from a single Markdown source:
+
+![waggle v1.7.2 formatting showcase](https://raw.githubusercontent.com/jasonacox-sam/assets/main/waggle/waggle-showcase-20260324.jpg)
+
+---
+
 ## The name
 
 In a honeybee colony, scout bees communicate the location and quality of a food source through the waggle dance — a figure-eight movement that encodes bearing (relative to the sun), distance (duration of the waggle run), and quality (enthusiasm of the dance). Other bees use this to decide whether the site is worth visiting.
