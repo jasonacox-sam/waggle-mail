@@ -3,31 +3,69 @@
 waggle — Not just a message. A vector.
 
 Multipart email (plain text + HTML) for AI agents who write letters.
+Full IMAP + SMTP client: list, read, reply, move, download attachments, send.
 
 The waggle dance encodes direction, distance, and quality — the full vector,
 not just a scalar ping. A good letter does the same. This tool helps send them.
 
-Usage (CLI):
-    python3 waggle.py --to recipient@example.com \\
-                      --subject "Hello" \\
-                      --body "# Hi\\n\\nThis is **markdown**."
+Usage (CLI — subcommands):
+
+    # List inbox
+    waggle list
+    waggle list --folder INBOX.Processed --limit 30
+
+    # Read a message (prints body + threading headers + reply template)
+    waggle read 42
+    waggle read 42 --folder INBOX.Processed
+
+    # Move a message between folders
+    waggle move 42 INBOX.Processed
+    waggle move 42 INBOX.Processed --folder INBOX
+
+    # Download attachments
+    waggle attach 42
+    waggle attach 42 --folder INBOX --dest /tmp/attachments/
+
+    # Send a new email
+    waggle send --to recipient@example.com --subject "Hello" --body "# Hi"
 
     # Reply with auto-fetched quoted body (requires WAGGLE_IMAP_HOST):
-    python3 waggle.py --to recipient@example.com \\
-                      --subject "Re: Hello" \\
-                      --body "# Thanks\\n\\nGreat to hear from you." \\
-                      --in-reply-to "<message-id@example.com>"
+    waggle send --to sender@example.com \\
+                --subject "Re: Hello" \\
+                --body "Thanks!" \\
+                --in-reply-to "<message-id@example.com>"
 
-    # Rich HTML with syntax highlighting and styled layout (opt-in):
-    python3 waggle.py --to recipient@example.com \\
-                      --subject "Hello" \\
-                      --body "# Hi" \\
-                      --rich
+    # Rich HTML with styled layout (opt-in):
+    waggle send --to recipient@example.com --subject "Hello" --body "# Hi" --rich
 
-Usage (Python):
-    from waggle import send_email
-    send_email(to="recipient@example.com", subject="Hello", body_md="# Hi")
-    send_email(..., rich=True)   # opt-in rich rendering
+Usage (Python API):
+
+    from waggle import send_email, list_inbox, read_message, move_message, download_attachments
+
+    # List inbox
+    messages = list_inbox(folder="INBOX", limit=20)
+    for m in messages:
+        print(m["uid"], m["from"], m["subject"], m["date"])
+
+    # Read a message
+    msg = read_message("42", folder="INBOX")
+    print(msg["body_plain"])
+    print(msg["message_id"])   # use for in_reply_to
+
+    # Reply
+    send_email(
+        to=msg["from_addr"],
+        subject=msg["reply_subject"],
+        body_md="Your reply here.",
+        in_reply_to=msg["message_id"],
+        references=msg["reply_references"],
+    )
+
+    # Move to processed
+    move_message("42", dest_folder="INBOX.Processed", src_folder="INBOX")
+
+    # Download attachments
+    paths = download_attachments("42", folder="INBOX", dest_dir="/tmp/attachments/")
 
 Configuration (environment variables):
     WAGGLE_HOST      SMTP host (default: localhost)
@@ -38,20 +76,20 @@ Configuration (environment variables):
     WAGGLE_NAME      Display name for From header
     WAGGLE_TLS       Use SSL/TLS (default: true; set 'false' for STARTTLS)
 
-    WAGGLE_IMAP_HOST IMAP host for auto-fetching quoted reply body (optional)
-                     Defaults to WAGGLE_HOST if not set.
+    WAGGLE_IMAP_HOST IMAP host (default: WAGGLE_HOST)
     WAGGLE_IMAP_PORT IMAP port (default: 993)
     WAGGLE_IMAP_TLS  Use IMAP SSL (default: true)
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
-
-Or pass a config dict directly to send_email().
 """
+
+__version__ = "1.8.1"
 
 import os
 import re
 import ssl
 import imaplib
 import email as email_lib
+from email.header import decode_header, make_header
 import smtplib
 import argparse
 import logging
@@ -66,11 +104,9 @@ from email.charset import Charset, QP
 from email.utils import parseaddr, formataddr
 from urllib.parse import urlparse
 
-# Set up basic logging
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Quoted-printable charset — avoids base64 encoding of text parts
 _UTF8_QP = Charset("utf-8")
 _UTF8_QP.body_encoding = QP
 
@@ -80,7 +116,6 @@ _UTF8_QP.body_encoding = QP
 # ---------------------------------------------------------------------------
 
 def _sanitize_header(value):
-    """Remove CR/LF characters to prevent header injection."""
     if value is None:
         return None
     if re.search(r'[\r\n]', str(value)):
@@ -89,7 +124,6 @@ def _sanitize_header(value):
 
 
 def _validate_email(addr):
-    """Extract bare email address from 'Name <addr>' format."""
     if not addr:
         return None
     _, email = parseaddr(addr)
@@ -98,39 +132,57 @@ def _validate_email(addr):
     return email
 
 
+def _decode_header_str(raw):
+    """Decode a potentially RFC2047-encoded header value to a plain string."""
+    if not raw:
+        return ""
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return str(raw)
+
+
 # ---------------------------------------------------------------------------
-# IMAP: Fetch quoted body for replies
+# IMAP: Connection helpers
 # ---------------------------------------------------------------------------
+
+def _build_cfg(config=None):
+    """Merge explicit config dict with environment variable fallbacks."""
+    cfg = config or {}
+    return {
+        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or os.environ.get("WAGGLE_HOST", ""),
+        "imap_port":  int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT", "993")),
+        "imap_tls":   cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", "true").lower() != "false"),
+        "user":       cfg.get("user")       or os.environ.get("WAGGLE_USER", ""),
+        "password":   cfg.get("password")   or os.environ.get("WAGGLE_PASS", ""),
+        "host":       cfg.get("host")       or os.environ.get("WAGGLE_HOST", "localhost"),
+        "port":       int(cfg.get("port")   or os.environ.get("WAGGLE_PORT", "465")),
+        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM", cfg.get("user") or os.environ.get("WAGGLE_USER", "")),
+        "from_name":  cfg.get("from_name")  or os.environ.get("WAGGLE_NAME", ""),
+        "tls":        cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false"),
+    }
+
 
 def _imap_connect(cfg):
-    """Return an authenticated IMAP connection or None if not configured."""
-    imap_host = cfg.get("imap_host") or os.environ.get("WAGGLE_IMAP_HOST") or \
-                os.environ.get("WAGGLE_HOST", "")
-    if not imap_host:
+    """Return an authenticated IMAP4 connection, or (None, None) if not configured."""
+    if not cfg.get("imap_host"):
         return None, None
-
-    raw_port = cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT", "993")
-    try:
-        imap_port = int(raw_port)
-    except (ValueError, TypeError):
-        imap_port = 993
-
-    use_tls  = cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", "true").lower() != "false")
-    user     = cfg.get("user")     or os.environ.get("WAGGLE_USER", "")
-    password = cfg.get("password") or os.environ.get("WAGGLE_PASS", "")
-
     ctx = ssl.create_default_context()
-    if use_tls:
-        m = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=ctx)
+    if cfg["imap_tls"]:
+        m = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=ctx)
     else:
-        m = imaplib.IMAP4(imap_host, imap_port)
-    m.login(user, password)
-    return m, imap_host
+        m = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
+    m.login(cfg["user"], cfg["password"])
+    return m, cfg["imap_host"]
 
 
 def _imap_find_uid(m, mid):
-    """Search all folders for a message by Message-ID. Returns (folder, uid) or (None, None)."""
-    preferred = ["INBOX", "INBOX.Processed", '"Sent Items"', "Sent"]
+    """
+    Search all folders for a message by Message-ID.
+    Returns (folder_name, uid_bytes) or (None, None).
+    Searches INBOX and INBOX.Processed first, then all other folders.
+    """
+    preferred = ["INBOX", "INBOX.Processed", "INBOX.Sent", '"Sent Items"', "Sent"]
     try:
         _, folder_data = m.list()
         all_folders = []
@@ -158,20 +210,424 @@ def _imap_find_uid(m, mid):
     return None, None
 
 
+def _parse_message(raw_bytes):
+    """
+    Parse a raw email message and return a structured dict.
+    Keys: message_id, references, in_reply_to, from_addr, from_name,
+          to, subject, date, body_plain, body_html, attachments (list of dicts)
+    """
+    msg = email_lib.message_from_bytes(raw_bytes)
+
+    message_id  = _decode_header_str(msg.get("Message-ID", "")).strip()
+    references  = _decode_header_str(msg.get("References", "")).strip()
+    in_reply_to = _decode_header_str(msg.get("In-Reply-To", "")).strip()
+    from_raw    = _decode_header_str(msg.get("From", ""))
+    from_name_p, from_addr_p = parseaddr(from_raw)
+    subject     = _decode_header_str(msg.get("Subject", ""))
+    date        = _decode_header_str(msg.get("Date", ""))
+    to          = _decode_header_str(msg.get("To", ""))
+
+    body_plain = None
+    body_html  = None
+    attachments = []
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct  = part.get_content_type()
+            cd  = str(part.get("Content-Disposition", ""))
+            fn  = part.get_filename()
+            if fn:
+                fn = _decode_header_str(fn)
+
+            if "attachment" in cd or fn:
+                payload = part.get_payload(decode=True)
+                attachments.append({
+                    "filename":     fn or "attachment",
+                    "content_type": ct,
+                    "size":         len(payload) if payload else 0,
+                    "payload":      payload,
+                })
+            elif ct == "text/plain" and body_plain is None:
+                p = part.get_payload(decode=True)
+                if p:
+                    body_plain = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+            elif ct == "text/html" and body_html is None:
+                p = part.get_payload(decode=True)
+                if p:
+                    body_html = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+    else:
+        p = msg.get_payload(decode=True)
+        if p:
+            body_plain = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+
+    # Build reply references chain
+    if references and message_id:
+        reply_references = f"{references} {message_id}".strip()
+    elif message_id:
+        reply_references = message_id
+    else:
+        reply_references = ""
+
+    reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+    return {
+        "message_id":       message_id,
+        "references":       references,
+        "in_reply_to":      in_reply_to,
+        "reply_references": reply_references,
+        "reply_subject":    reply_subject,
+        "from_addr":        from_addr_p,
+        "from_name":        from_name_p,
+        "from_raw":         from_raw,
+        "to":               to,
+        "subject":          subject,
+        "date":             date,
+        "body_plain":       body_plain,
+        "body_html":        body_html,
+        "attachments":      attachments,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public IMAP API
+# ---------------------------------------------------------------------------
+
+def list_inbox(folder="INBOX", limit=20, config=None):
+    """
+    List email envelopes from a folder.
+
+    Returns a list of dicts, most recent first:
+        uid, message_id, from_addr, from_name, from_raw, subject, date, flags, size
+
+    Args:
+        folder: IMAP folder name (default: INBOX)
+        limit:  Max number of messages to return (default: 20)
+        config: Optional config dict (falls back to env vars)
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    try:
+        status, _ = m.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {folder!r}")
+
+        status, data = m.search(None, "ALL")
+        if status != "OK" or not data[0]:
+            return []
+
+        uids = data[0].split()
+        # Most recent last — take the last `limit` and reverse
+        uids = uids[-limit:][::-1]
+
+        results = []
+        for uid in uids:
+            try:
+                _, msg_data = m.fetch(uid, "(FLAGS RFC822.SIZE BODY[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])")
+                if not msg_data or msg_data[0] is None:
+                    continue
+                raw_headers = b""
+                flags_str = ""
+                size = 0
+                for part in msg_data:
+                    if isinstance(part, tuple):
+                        info = part[0].decode() if isinstance(part[0], bytes) else str(part[0])
+                        if "FLAGS" in info:
+                            flags_match = re.search(r'FLAGS \(([^)]*)\)', info)
+                            if flags_match:
+                                flags_str = flags_match.group(1)
+                            size_match = re.search(r'RFC822\.SIZE (\d+)', info)
+                            if size_match:
+                                size = int(size_match.group(1))
+                        raw_headers = part[1] if isinstance(part[1], bytes) else b""
+
+                message_id = from_raw = subject = date = ""
+                for line in raw_headers.decode("utf-8", errors="replace").splitlines():
+                    lower = line.lower()
+                    if lower.startswith("message-id:"):
+                        message_id = _decode_header_str(line.split(":", 1)[1].strip())
+                    elif lower.startswith("from:"):
+                        from_raw = _decode_header_str(line.split(":", 1)[1].strip())
+                    elif lower.startswith("subject:"):
+                        subject = _decode_header_str(line.split(":", 1)[1].strip())
+                    elif lower.startswith("date:"):
+                        date = line.split(":", 1)[1].strip()
+
+                from_name_p, from_addr_p = parseaddr(from_raw)
+                results.append({
+                    "uid":        uid.decode() if isinstance(uid, bytes) else str(uid),
+                    "message_id": message_id,
+                    "from_addr":  from_addr_p,
+                    "from_name":  from_name_p,
+                    "from_raw":   from_raw,
+                    "subject":    subject,
+                    "date":       date,
+                    "flags":      flags_str,
+                    "size":       size,
+                    "unread":     r"\Seen" not in flags_str,
+                })
+            except Exception as e:
+                logger.warning(f"Error fetching envelope for uid {uid}: {e}")
+                continue
+
+        return results
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def read_message(uid, folder="INBOX", config=None):
+    """
+    Read a full email message by IMAP sequence number / UID.
+
+    Returns a structured dict with body, headers, threading info, and attachment list.
+    Use msg["message_id"] and msg["reply_references"] for waggle send_email().
+
+    Args:
+        uid:    IMAP sequence number (as string or int)
+        folder: IMAP folder (default: INBOX)
+        config: Optional config dict
+
+    Returns dict keys:
+        uid, folder, message_id, references, in_reply_to, reply_references,
+        reply_subject, from_addr, from_name, from_raw, to, subject, date,
+        body_plain, body_html, attachments (list of {filename, content_type, size})
+
+    Note: attachments list contains metadata only — call download_attachments()
+    to save files to disk.
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    try:
+        status, _ = m.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {folder!r}")
+
+        uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
+        typ, data = m.fetch(uid_bytes, "(BODY.PEEK[])")
+        if typ != "OK" or not data or data[0] is None:
+            raise RuntimeError(f"Message {uid} not found in {folder}")
+
+        raw = data[0][1]
+        result = _parse_message(raw)
+        result["uid"]    = str(uid)
+        result["folder"] = folder
+        return result
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def move_message(uid, dest_folder, src_folder="INBOX", config=None):
+    """
+    Move a message from src_folder to dest_folder.
+
+    Uses UID COPY + UID STORE + EXPUNGE so sequence number shifts don't matter.
+    Use this after sending a reply: move_message("42", "INBOX.Processed")
+
+    Args:
+        uid:         IMAP sequence number or UID (as returned by list_inbox/read_message)
+        dest_folder: Target folder (e.g. "INBOX.Processed")
+        src_folder:  Source folder (default: INBOX)
+        config:      Optional config dict
+
+    Returns True on success.
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    try:
+        status, _ = m.select(src_folder)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {src_folder!r}")
+
+        seq = str(uid)
+
+        # First resolve to a real UID via UID SEARCH on the sequence number
+        # This makes the operation immune to sequence-number shifts from prior expunges
+        status, data = m.fetch(seq, "(UID)")
+        real_uid = seq  # fallback
+        if status == "OK" and data and data[0]:
+            raw = data[0].decode() if isinstance(data[0], bytes) else str(data[0])
+            m_uid = re.search(r'UID (\d+)', raw)
+            if m_uid:
+                real_uid = m_uid.group(1)
+
+        uid_bytes = real_uid.encode() if isinstance(real_uid, str) else real_uid
+
+        # UID COPY to destination
+        status, _ = m.uid("COPY", uid_bytes, dest_folder)
+        if status != "OK":
+            raise RuntimeError(f"UID COPY to {dest_folder!r} failed: {status}")
+
+        # Mark original as deleted (by UID)
+        m.uid("STORE", uid_bytes, "+FLAGS", r"(\Deleted)")
+
+        # Expunge
+        m.expunge()
+        return True
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
+    """
+    Download all attachments from a message to dest_dir.
+
+    Args:
+        uid:      IMAP sequence number
+        folder:   IMAP folder (default: INBOX)
+        dest_dir: Directory to save files (created if needed)
+        config:   Optional config dict
+
+    Returns list of saved file paths (strings).
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+
+    try:
+        status, _ = m.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {folder!r}")
+
+        uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
+        typ, data = m.fetch(uid_bytes, "(BODY.PEEK[])")
+        if typ != "OK" or not data or data[0] is None:
+            raise RuntimeError(f"Message {uid} not found in {folder}")
+
+        msg = email_lib.message_from_bytes(data[0][1])
+
+        for i, part in enumerate(msg.walk()):
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            fn = part.get_filename()
+            if fn:
+                fn = _decode_header_str(fn)
+
+            # Save if it has a filename OR is marked as attachment
+            if not fn and "attachment" not in cd:
+                continue
+
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+
+            if not fn:
+                ext = mimetypes.guess_extension(ct) or ".bin"
+                fn = f"attachment_{i}{ext}"
+
+            # Sanitize filename
+            fn = re.sub(r'[^\w\-_\. ]', '_', fn)
+            out_path = dest / fn
+
+            # Avoid overwrites
+            counter = 1
+            while out_path.exists():
+                stem = Path(fn).stem
+                suffix = Path(fn).suffix
+                out_path = dest / f"{stem}_{counter}{suffix}"
+                counter += 1
+
+            out_path.write_bytes(payload)
+            saved_paths.append(str(out_path))
+
+        return saved_paths
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# IMAP: Check for recently sent duplicates
+# ---------------------------------------------------------------------------
+
+_SEND_LOG = Path(os.environ.get("WAGGLE_SEND_LOG",
+    str(Path.home() / ".openclaw" / "workspace" / "tmp" / "waggle-sent.log")))
+
+
+def _log_sent(to, subject):
+    """Append a send record to the local sent log."""
+    import time
+    _SEND_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(_SEND_LOG, "a") as f:
+        f.write(f"{int(time.time())}|{(_validate_email(to) or to).lower()}|{subject.lower().strip()}\n")
+
+
+def check_recently_sent(to, subject, within_minutes=5, config=None):
+    """
+    Check the local send log for a matching email sent recently.
+    Use before retrying a send to avoid duplicates caused by SMTP slowness.
+
+    Returns True if a duplicate was found (skip the send).
+    Returns False if safe to send.
+
+    Args:
+        to:              Recipient address
+        subject:         Subject line (partial match)
+        within_minutes:  How far back to look (default: 5 minutes)
+        config:          Unused, kept for API compatibility
+    """
+    import time
+    if not _SEND_LOG.exists():
+        return False
+    cutoff = int(time.time()) - (within_minutes * 60)
+    to_addr = (_validate_email(to) or to).lower()
+    subj_lower = subject.lower().strip()
+    try:
+        with open(_SEND_LOG) as f:
+            for line in f:
+                parts = line.strip().split("|", 2)
+                if len(parts) != 3:
+                    continue
+                ts, log_to, log_subj = parts
+                if int(ts) < cutoff:
+                    continue
+                if log_to == to_addr and (subj_lower in log_subj or log_subj in subj_lower):
+                    return True
+    except Exception as e:
+        logger.warning(f"check_recently_sent failed: {e}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# IMAP: Fetch quoted body for replies (used internally by send_email)
+# ---------------------------------------------------------------------------
+
 def fetch_quoted_body(message_id, config=None):
     """
     Fetch the original message from IMAP and return (quoted_plain, quoted_html).
 
     Outlook-style quoting:
-    - plain: full body under -----Original Message----- attribution header (snowballs naturally)
-    - html:  original email HTML wrapped in a <div> blockquote (snowballs naturally)
+    - plain: -----Original Message----- block
+    - html:  left-border blockquote div (snowballs like Outlook)
 
-    Searches all folders so it works after the original is moved to INBOX.Processed.
+    Searches all folders — works even after message is moved to INBOX.Processed.
     Returns (None, None) if IMAP is not configured or message not found.
     """
-    from email.header import decode_header, make_header
-
-    cfg = config or {}
+    cfg = _build_cfg(config)
 
     mid = message_id.strip()
     if not mid.startswith("<"):
@@ -189,7 +645,6 @@ def fetch_quoted_body(message_id, config=None):
             m.logout()
             return None, None
 
-        # Re-select the folder (find may have left us somewhere else)
         m.select(folder, readonly=True)
         typ, data = m.fetch(uid, "(BODY.PEEK[])")
         m.logout()
@@ -197,45 +652,21 @@ def fetch_quoted_body(message_id, config=None):
         if typ != "OK" or not data or data[0] is None:
             return None, None
 
-        msg = email_lib.message_from_bytes(data[0][1])
+        parsed = _parse_message(data[0][1])
+        from_hdr = parsed["from_raw"]
+        date_hdr = parsed["date"]
+        subj_hdr = parsed["subject"]
+        plain_body = parsed["body_plain"]
+        html_body  = parsed["body_html"]
 
-        from_hdr = str(make_header(decode_header(msg.get("From", "")  or "")))
-        date_hdr = str(make_header(decode_header(msg.get("Date", "")  or "")))
-        subj_hdr = str(make_header(decode_header(msg.get("Subject", "") or "")))
-
-        plain_body = html_body = None
-        if msg.is_multipart():
-            for part in msg.walk():
-                ct = part.get_content_type()
-                cd = str(part.get("Content-Disposition", ""))
-                if "attachment" in cd:
-                    continue
-                if ct == "text/plain" and plain_body is None:
-                    p = part.get_payload(decode=True)
-                    if p:
-                        plain_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
-                elif ct == "text/html" and html_body is None:
-                    p = part.get_payload(decode=True)
-                    if p:
-                        html_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
-        else:
-            p = msg.get_payload(decode=True)
-            if p:
-                plain_body = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
-
-        # --- Plain text quoted block (Outlook style, full body, no trimming) ---
         attr_plain = (
             f"-----Original Message-----\n"
             f"From: {from_hdr}\n"
             f"Sent: {date_hdr}\n"
             f"Subject: {subj_hdr}"
         )
-        if plain_body:
-            quoted_plain = f"\n\n{attr_plain}\n\n{plain_body.strip()}"
-        else:
-            quoted_plain = f"\n\n{attr_plain}"
+        quoted_plain = f"\n\n{attr_plain}\n\n{plain_body.strip()}" if plain_body else f"\n\n{attr_plain}"
 
-        # --- HTML quoted block (Outlook-style left-border blockquote) ---
         attr_html = (
             f'<p style="margin:0 0 8px 0;font-size:12px;color:#777;">'
             f'<b>From:</b> {from_hdr}<br>'
@@ -254,11 +685,8 @@ def fetch_quoted_body(message_id, config=None):
         quoted_html = (
             f'<div style="border-left:2px solid #ccc;padding-left:12px;'
             f'margin-top:16px;color:#555;">'
-            f'{attr_html}'
-            f'{inner}'
-            f'</div>'
+            f'{attr_html}{inner}</div>'
         )
-
         return quoted_plain, quoted_html
 
     except Exception as e:
@@ -267,16 +695,7 @@ def fetch_quoted_body(message_id, config=None):
 
 
 # ---------------------------------------------------------------------------
-# HTML rendering — two modes
-#
-# DEFAULT (simple):  inline styles only, no <head>/<style> block.
-#   - Works in Gmail (which strips <head> and <style> entirely)
-#   - Less likely to trigger spam filters
-#   - Looks like a real email from Outlook or Apple Mail
-#
-# RICH (opt-in via --rich / rich=True):  full pipeline with <head> CSS,
-#   syntax-highlighted code blocks via pygments. Beautiful in most clients,
-#   but stripped by Gmail and can look like marketing email.
+# HTML rendering — two modes (unchanged from v1.1)
 # ---------------------------------------------------------------------------
 
 def _escape_html(text):
@@ -290,8 +709,6 @@ def _validate_url(url):
     return parsed.scheme in ('http', 'https', 'mailto')
 
 
-# --- Simple (default) renderer — inline styles, no <head> dependency ---
-
 _PRE_STYLE = (
     "display:block;background:#f8f8f8;color:#333;"
     "padding:8px 12px;border-radius:3px;border:1px solid #e0e0e0;"
@@ -301,7 +718,6 @@ _PRE_STYLE = (
 
 
 def _highlight_code(lang, code_raw):
-    """Render a code block with pygments inline styles, or plain fallback."""
     try:
         from pygments import highlight
         from pygments.lexers import get_lexer_by_name, TextLexer
@@ -310,11 +726,7 @@ def _highlight_code(lang, code_raw):
             lexer = get_lexer_by_name(lang) if lang else TextLexer()
         except Exception:
             lexer = TextLexer()
-        formatter = HtmlFormatter(
-            style="friendly",
-            noclasses=True,   # inline styles — no <head> needed, Gmail-safe
-            nowrap=True,      # we supply the <pre> wrapper
-        )
+        formatter = HtmlFormatter(style="friendly", noclasses=True, nowrap=True)
         highlighted = highlight(code_raw, lexer, formatter)
         return f'<pre style="{_PRE_STYLE}">{highlighted}</pre>'
     except ImportError:
@@ -323,17 +735,6 @@ def _highlight_code(lang, code_raw):
 
 
 def _md_to_html_simple(text):
-    """
-    Render markdown to HTML with inline styles. No <head> CSS required.
-
-    Code blocks are extracted first (before any other processing) to prevent
-    inline-emphasis and paragraph-splitter from mangling code content.
-    """
-    # ------------------------------------------------------------------ #
-    # Step 1: Extract fenced code blocks FIRST — replace with placeholders #
-    # Placeholders use null bytes so _escape_html won't touch them, and    #
-    # the paragraph handler can identify and restore them intact.           #
-    # ------------------------------------------------------------------ #
     _blocks = []
 
     def _extract_fence(m):
@@ -342,34 +743,25 @@ def _md_to_html_simple(text):
         rendered = _highlight_code(lang, code_raw)
         idx = len(_blocks)
         _blocks.append(rendered)
-        # Surround with newlines so paragraph splitter treats it as a block
         return f"\n\n\x00WCODE{idx}\x00\n\n"
 
     text = re.sub(r"```(\w*)\n(.*?)```", _extract_fence, text, flags=re.DOTALL)
-
-    # Step 2: HTML-escape everything EXCEPT the placeholders (null bytes safe)
     html = _escape_html(text)
 
-    # Step 3: Markdown processing (headings, emphasis, lists, etc.)
-    # Headings — append \n\n so they always create a paragraph boundary,
-    # preventing the following content from being absorbed into the heading's
-    # HTML block and losing <br> conversion on single newlines.
     html = re.sub(r"^### (.+)$",
-        r'<h3 style="font-family:Calibri,Aptos,Arial,sans-serif;font-size:13pt;margin:16px 0 4px 0;">\1</h3>\n',
+        r'<h3 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:14pt;margin:16px 0 4px 0;">\1</h3>\n',
         html, flags=re.MULTILINE)
     html = re.sub(r"^## (.+)$",
-        r'<h2 style="font-family:Calibri,Aptos,Arial,sans-serif;font-size:15pt;margin:20px 0 6px 0;">\1</h2>\n',
+        r'<h2 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:16pt;margin:20px 0 6px 0;">\1</h2>\n',
         html, flags=re.MULTILINE)
     html = re.sub(r"^# (.+)$",
-        r'<h1 style="font-family:Calibri,Aptos,Arial,sans-serif;font-size:18pt;margin:24px 0 8px 0;">\1</h1>\n',
+        r'<h1 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:20pt;margin:24px 0 8px 0;">\1</h1>\n',
         html, flags=re.MULTILINE)
 
-    # Inline emphasis (safe — code content already extracted)
     html = re.sub(r"\*\*\*(.+?)\*\*\*", r"<strong><em>\1</em></strong>", html)
     html = re.sub(r"\*\*(.+?)\*\*",     r"<strong>\1</strong>", html)
     html = re.sub(r"\*(.+?)\*",         r"<em>\1</em>", html)
 
-    # Inline code
     html = re.sub(
         r"`(.+?)`",
         r'<code style="background:#f5f5f5;padding:1px 4px;border-radius:2px;'
@@ -377,7 +769,6 @@ def _md_to_html_simple(text):
         html
     )
 
-    # Links
     def _link(m):
         link_text = m.group(1)
         url = m.group(2).replace('&quot;', '"')
@@ -387,12 +778,10 @@ def _md_to_html_simple(text):
         return f'<a href="{url}" style="color:#0066cc;" rel="noopener noreferrer">{link_text}</a>'
     html = re.sub(r"\[(.+?)\]\((.+?)\)", _link, html)
 
-    # Horizontal rule
     html = re.sub(r"^---+$",
         r'<hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">',
         html, flags=re.MULTILINE)
 
-    # Blockquote (> lines)
     def _quoteblock(m):
         lines = re.findall(r"^&gt; ?(.*)$", m.group(0), re.MULTILINE)
         inner = "<br>\n".join(lines)
@@ -402,24 +791,21 @@ def _md_to_html_simple(text):
         )
     html = re.sub(r"(^&gt;.*\n?)+", _quoteblock, html, flags=re.MULTILINE)
 
-    # Unordered lists
     def _ul_block(m):
         items = re.findall(r"^[-*] (.+)$", m.group(0), re.MULTILINE)
         lis = "".join(f'<li style="margin:2px 0;">{i}</li>' for i in items)
         return f'<ul style="margin:8px 0;padding-left:20px;">{lis}</ul>'
     html = re.sub(r"(^[-*] .+\n?)+", _ul_block, html, flags=re.MULTILINE)
 
-    # Ordered lists
     def _ol_block(m):
         items = re.findall(r"^\d+\. (.+)$", m.group(0), re.MULTILINE)
         lis = "".join(f'<li style="margin:2px 0;">{i}</li>' for i in items)
-        return f'<ol style="margin:8px 0;padding-left:20px;">{lis}</ol>'
+        return f'<ol style="margin:8px 0;padding-left:20px;">{lis}</ul>'
     html = re.sub(r"(^\d+\. .+\n?)+", _ol_block, html, flags=re.MULTILINE)
 
-    # Step 4: Paragraphs — restore code placeholders as block elements
     _p_style = (
-        'margin:0 0 10px 0;font-family:Calibri,Aptos,Arial,sans-serif;'
-        'font-size:11pt;color:#000;'
+        'margin:0 0 10px 0;font-family:Aptos,Calibri,Arial,sans-serif;'
+        'font-size:12pt;color:#000;'
     )
     paragraphs = re.split(r"\n{2,}", html.strip())
     wrapped = []
@@ -427,7 +813,6 @@ def _md_to_html_simple(text):
         p = p.strip()
         if not p:
             continue
-        # Code placeholder — restore rendered block, no <p> wrapping
         m = re.fullmatch(r"\x00WCODE(\d+)\x00", p)
         if m:
             wrapped.append(_blocks[int(m.group(1))])
@@ -441,47 +826,32 @@ def _md_to_html_simple(text):
 
 
 def _wrap_html_simple(body_html):
-    """Minimal HTML wrapper — no <head> CSS, just a font on the body."""
     return (
-        '<!DOCTYPE html><html><body style="font-family:Calibri,Aptos,Arial,sans-serif;'
-        'font-size:11pt;color:#000;max-width:700px;">\n'
+        '<!DOCTYPE html><html><body style="font-family:Aptos,Calibri,Arial,sans-serif;'
+        'font-size:12pt;color:#000;max-width:700px;">\n'
         + body_html
         + "\n</body></html>"
     )
 
 
-# --- Rich (opt-in) renderer — <head> CSS + pygments syntax highlighting ---
-
 def _md_to_html_rich(text):
-    """Full markdown rendering with syntax-highlighted code blocks (opt-in)."""
     import markdown as md_lib
-
     extensions = ["extra", "codehilite", "tables", "fenced_code", "nl2br"]
-    ext_configs = {
-        "codehilite": {
-            "noclasses": True,
-            "guess_lang": False,
-        }
-    }
+    ext_configs = {"codehilite": {"noclasses": True, "guess_lang": False}}
     try:
         html = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
     except Exception as e:
         logger.warning(f"Rich markdown rendering failed: {e}, falling back to simple")
         html = md_lib.markdown(text)
-
     html = re.sub(
         r'(<div class="codehilite")\s+(style="([^"]*)")',
-        lambda m: (
-            f'{m.group(1)} style="{m.group(3).rstrip(";")};'
-            f' padding:10px 14px; border-radius:4px;"'
-        ),
+        lambda m: f'{m.group(1)} style="{m.group(3).rstrip(";")};padding:10px 14px;border-radius:4px;"',
         html,
     )
     return html
 
 
 def _wrap_html_rich(body_html):
-    """Styled HTML wrapper with <head> CSS (opt-in)."""
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -506,20 +876,12 @@ def _wrap_html_rich(body_html):
 </html>"""
 
 
-# ---------------------------------------------------------------------------
-# Plain text
-# ---------------------------------------------------------------------------
-
 def _md_to_plain(text):
-    """
-    Return markdown source as plain text — no stripping.
-    AI agents reading with himalaya parse markdown natively.
-    """
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Core send function
+# Public: send_email (unchanged API from v1.1)
 # ---------------------------------------------------------------------------
 
 def send_email(
@@ -539,65 +901,41 @@ def send_email(
     """
     Send a multipart email rendered from Markdown.
 
-    HTML rendering:
-      Default (rich=False): minimal inline-styled HTML — works in Gmail, less
-        likely to trigger spam filters, looks like a real email.
-      rich=True: full pipeline with <head> CSS and syntax-highlighted code
-        blocks. Looks great in Outlook/Apple Mail; stripped by Gmail.
-
     When in_reply_to is provided and WAGGLE_IMAP_HOST is configured, waggle
-    automatically fetches the original message from IMAP and appends a
-    formatted quoted block. Falls back gracefully if IMAP is unavailable.
+    automatically fetches the original message and appends a quoted block.
 
     Args:
         to:           Recipient address or "Name <addr>" string.
-        subject:      Email subject line.
+        subject:      Subject line.
         body_md:      Message body in Markdown.
         cc:           Optional CC address(es), comma-separated.
         reply_to:     Optional Reply-To address.
-        in_reply_to:  Message-ID of email being replied to (triggers quote fetch + threading).
-        references:   References header value (threading).
-        from_name:    Display name for the From header.
+        in_reply_to:  Message-ID of email being replied to (enables threading + auto-quote).
+        references:   References header (threading chain).
+        from_name:    Display name for From header.
         attachments:  List of file paths to attach.
-        rich:         Enable rich HTML rendering (opt-in).
-        config:       Dict with SMTP + IMAP keys. Falls back to env vars if omitted.
+        rich:         Enable rich HTML rendering (opt-in, stripped by Gmail).
+        config:       Config dict (falls back to env vars).
     """
-    cfg = config or {}
+    cfg = _build_cfg(config)
 
-    raw_port = cfg.get("port") or os.environ.get("WAGGLE_PORT", "465")
-    try:
-        port = int(raw_port)
-    except (ValueError, TypeError):
-        raise ValueError(f"Invalid SMTP port: {raw_port!r}")
-
-    host      = cfg.get("host")      or os.environ.get("WAGGLE_HOST", "localhost")
-    user      = cfg.get("user")      or os.environ.get("WAGGLE_USER", "")
-    password  = cfg.get("password")  or os.environ.get("WAGGLE_PASS", "")
-    from_addr = cfg.get("from_addr") or os.environ.get("WAGGLE_FROM", user)
-    name      = from_name or cfg.get("from_name") or os.environ.get("WAGGLE_NAME", "")
-    use_tls   = cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false")
-
-    # Auto-fetch quoted body from IMAP when replying
     quoted_plain = quoted_html = None
     if in_reply_to:
         quoted_plain, quoted_html = fetch_quoted_body(in_reply_to, config=cfg)
 
-    # Security: sanitize headers
     subject     = _sanitize_header(subject)
     to          = _sanitize_header(to)
     cc          = _sanitize_header(cc)
     reply_to    = _sanitize_header(reply_to)
     in_reply_to = _sanitize_header(in_reply_to)
     references  = _sanitize_header(references)
-    name        = _sanitize_header(name)
+    name        = _sanitize_header(from_name or cfg["from_name"])
 
-    from_header   = formataddr((name, from_addr)) if name else from_addr
-    envelope_from = _validate_email(from_addr)
+    from_header   = formataddr((name, cfg["from_addr"])) if name else cfg["from_addr"]
+    envelope_from = _validate_email(cfg["from_addr"])
     envelope_to   = [_validate_email(to)]
 
-    # Build body parts — render markdown first, then append quoted content after
     plain = _md_to_plain(body_md)
-
     if rich:
         try:
             html_body_rendered = _md_to_html_rich(body_md)
@@ -608,15 +946,12 @@ def send_email(
         html_body_rendered = _md_to_html_simple(body_md)
         html_full = _wrap_html_simple(html_body_rendered)
 
-    # Append quoted content AFTER rendering (not into markdown source)
     if quoted_plain:
         plain += quoted_plain
     if quoted_html:
         html_full = html_full.replace("</body>", f"\n{quoted_html}\n</body>")
 
-    # Build MIME structure
     alt = MIMEMultipart("alternative")
-    # Use quoted-printable (not base64) for text parts
     alt.attach(MIMEText(plain,     "plain", _UTF8_QP))
     alt.attach(MIMEText(html_full, "html",  _UTF8_QP))
 
@@ -658,25 +993,118 @@ def send_email(
         msg["References"]  = references
 
     ctx = ssl.create_default_context()
-
-    if use_tls:
-        with smtplib.SMTP_SSL(host, port, context=ctx) as s:
-            if user and password:
-                s.login(user, password)
+    if cfg["tls"]:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx) as s:
+            if cfg["user"] and cfg["password"]:
+                s.login(cfg["user"], cfg["password"])
             s.sendmail(envelope_from, envelope_to, msg.as_string())
     else:
-        with smtplib.SMTP(host, port) as s:
-            s.ehlo()
-            s.starttls(context=ctx)
-            s.ehlo()
-            if user and password:
-                s.login(user, password)
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as s:
+            s.ehlo(); s.starttls(context=ctx); s.ehlo()
+            if cfg["user"] and cfg["password"]:
+                s.login(cfg["user"], cfg["password"])
             s.sendmail(envelope_from, envelope_to, msg.as_string())
+
+    # Log the send so check_recently_sent() can detect duplicates
+    _log_sent(to, subject)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _fmt_size(n):
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n//1024}K"
+    return f"{n//(1024*1024)}M"
+
+
+def _cli_list(args):
+    msgs = list_inbox(folder=args.folder, limit=args.limit)
+    if not msgs:
+        print(f"(no messages in {args.folder})")
+        return
+    print(f"{'UID':<6} {'UNREAD':<7} {'FROM':<30} {'SUBJECT':<45} {'DATE'}")
+    print("-" * 110)
+    for m in msgs:
+        unread = "●" if m["unread"] else " "
+        frm    = (m["from_name"] or m["from_addr"])[:28]
+        subj   = m["subject"][:43]
+        date   = m["date"][:20] if m["date"] else ""
+        print(f"{m['uid']:<6} {unread:<7} {frm:<30} {subj:<45} {date}")
+
+
+def _cli_read(args):
+    msg = read_message(args.uid, folder=args.folder)
+    print("=" * 70)
+    print(f"From:    {msg['from_raw']}")
+    print(f"To:      {msg['to']}")
+    print(f"Date:    {msg['date']}")
+    print(f"Subject: {msg['subject']}")
+    if msg["attachments"]:
+        att_list = ", ".join(
+            f"{a['filename']} ({_fmt_size(a['size'])})"
+            for a in msg["attachments"]
+        )
+        print(f"Attach:  {att_list}")
+    print("=" * 70)
+    print(msg["body_plain"] or "(no plain text body)")
+    print()
+    print("─" * 70)
+    print("THREADING — use these for waggle send_email() reply:")
+    print(f"  message_id       = {msg['message_id'] or '(none)'}")
+    print(f"  reply_references = {msg['reply_references'] or '(none)'}")
+    print(f"  reply_subject    = {msg['reply_subject']}")
+    print()
+    print("PYTHON REPLY TEMPLATE:")
+    print("  import sys")
+    print("  sys.path.insert(0, '/home/jason/.openclaw/workspace/projects/waggle')")
+    print("  from waggle import send_email, move_message")
+    print("  send_email(")
+    print(f'      to="{msg["from_addr"]}",')
+    print(f'      subject="{msg["reply_subject"]}",')
+    print(f'      body_md="""YOUR REPLY HERE""",')
+    print(f'      in_reply_to="{msg["message_id"]}",')
+    print(f'      references="{msg["reply_references"]}",')
+    print(f'      from_name="Sam",')
+    print(f'  )')
+    print(f'  move_message("{msg["uid"]}", "INBOX.Processed", "{msg["folder"]}")')
+    print("─" * 70)
+
+
+def _cli_move(args):
+    move_message(args.uid, args.dest, src_folder=args.folder)
+    print(f"✅ Moved {args.uid} from {args.folder} → {args.dest}")
+
+
+def _cli_attach(args):
+    dest = args.dest or "./attachments"
+    paths = download_attachments(args.uid, folder=args.folder, dest_dir=dest)
+    if paths:
+        print(f"✅ Downloaded {len(paths)} attachment(s) to {dest}:")
+        for p in paths:
+            print(f"   {p}")
+    else:
+        print("(no attachments found)")
+
+
+def _cli_send(args):
+    send_email(
+        to=args.to,
+        subject=args.subject,
+        body_md=args.body,
+        cc=args.cc,
+        reply_to=getattr(args, "reply_to", None),
+        in_reply_to=getattr(args, "in_reply_to", None),
+        references=getattr(args, "references", None),
+        from_name=getattr(args, "from_name", None),
+        attachments=getattr(args, "attach", None),
+        rich=getattr(args, "rich", False),
+    )
+    print(f"✅ Sent to {args.to}")
+
 
 def cli_main():
     return main()
@@ -684,40 +1112,62 @@ def cli_main():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="waggle — send multipart email from Markdown",
-        epilog=(
-            "Default HTML is minimal inline-styled (Gmail-safe, spam-friendly). "
-            "Use --rich for syntax-highlighted code blocks and a styled layout."
-        )
+        prog="waggle",
+        description="waggle — full email client for AI agents (IMAP + SMTP)",
     )
-    parser.add_argument("--to",          required=True,  help="Recipient address")
-    parser.add_argument("--subject",     required=True,  help="Subject line")
-    parser.add_argument("--body",        required=True,  help="Message body (Markdown)")
-    parser.add_argument("--cc",          default=None,   help="CC address(es)")
-    parser.add_argument("--reply-to",    default=None,   help="Reply-To address")
-    parser.add_argument("--from-name",   default=None,   help="Display name for From header")
-    parser.add_argument("--in-reply-to", default=None,
+    parser.add_argument("--version", action="version", version=f"waggle {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    # --- list ---
+    p_list = sub.add_parser("list", help="List inbox envelopes")
+    p_list.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+    p_list.add_argument("--limit",  type=int, default=20, help="Max messages (default: 20)")
+
+    # --- read ---
+    p_read = sub.add_parser("read", help="Read a message (body + threading headers)")
+    p_read.add_argument("uid", help="IMAP sequence number")
+    p_read.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+
+    # --- move ---
+    p_move = sub.add_parser("move", help="Move a message to another folder")
+    p_move.add_argument("uid",  help="IMAP sequence number")
+    p_move.add_argument("dest", help="Destination folder (e.g. INBOX.Processed)")
+    p_move.add_argument("--folder", default="INBOX", help="Source folder (default: INBOX)")
+
+    # --- attach ---
+    p_att = sub.add_parser("attach", help="Download attachments from a message")
+    p_att.add_argument("uid", help="IMAP sequence number")
+    p_att.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+    p_att.add_argument("--dest",   default="./attachments", help="Destination directory")
+
+    # --- send ---
+    p_send = sub.add_parser("send", help="Send an email")
+    p_send.add_argument("--to",          required=True)
+    p_send.add_argument("--subject",     required=True)
+    p_send.add_argument("--body",        required=True, help="Markdown body")
+    p_send.add_argument("--cc",          default=None)
+    p_send.add_argument("--reply-to",    default=None)
+    p_send.add_argument("--from-name",   default=None)
+    p_send.add_argument("--in-reply-to", default=None,
                         help="Message-ID to reply to (enables threading + auto-quote)")
-    parser.add_argument("--references",  default=None,   help="References header for threading")
-    parser.add_argument("--attach",      action="append", default=None, metavar="FILE",
-                        help="File to attach (can be specified multiple times)")
-    parser.add_argument("--rich",        action="store_true", default=False,
-                        help="Rich HTML: <head> CSS + syntax-highlighted code (opt-in)")
+    p_send.add_argument("--references",  default=None)
+    p_send.add_argument("--attach",      action="append", default=None, metavar="FILE")
+    p_send.add_argument("--rich",        action="store_true", default=False)
+
     args = parser.parse_args()
 
-    send_email(
-        to=args.to,
-        subject=args.subject,
-        body_md=args.body,
-        cc=args.cc,
-        reply_to=args.reply_to,
-        in_reply_to=args.in_reply_to,
-        references=args.references,
-        from_name=args.from_name,
-        attachments=args.attach,
-        rich=args.rich,
-    )
-    print(f"✅ Sent to {args.to}")
+    dispatch = {
+        "list":   _cli_list,
+        "read":   _cli_read,
+        "move":   _cli_move,
+        "attach": _cli_attach,
+        "send":   _cli_send,
+    }
+
+    if args.command in dispatch:
+        dispatch[args.command](args)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 Metadata-Version: 2.1
 Name: waggle-mail
-Version: 1.7.2
-Summary: Multipart email for AI agents: plain text + HTML from Markdown, auto-quoted replies via IMAP
+Version: 1.8.1
+Summary: Full email client for AI agents: send, list, read, reply, move, download attachments. IMAP + SMTP, Markdown to HTML.
 Author-email: Sam Cox <sam@jasonacox.com>
 License: MIT
 Project-URL: Homepage, https://github.com/jasonacox-sam/waggle-mail
@@ -210,6 +210,14 @@ Then add your SMTP and IMAP credentials to `~/.openclaw/openclaw.json` under `sk
 | `---` | `<hr>` |
 
 Plain text body is **raw Markdown** — AI agents reading with himalaya or similar tools receive the original source, not a stripped approximation. Markdown is a first-class format for AI readers.
+
+---
+
+## Example Output
+
+The screenshot below shows `waggle` v1.7.2 rendering a formatting showcase email in Outlook (dark mode) — headings, paragraphs, bullet and numbered lists, blockquote, code block, and inline formatting, all generated from a single Markdown source:
+
+![waggle v1.7.2 formatting showcase](https://raw.githubusercontent.com/jasonacox-sam/assets/main/waggle/waggle-showcase-20260324.jpg)
 
 ---
 
