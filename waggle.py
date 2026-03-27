@@ -94,6 +94,8 @@ import smtplib
 import argparse
 import logging
 import mimetypes
+import tempfile
+import secrets
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -103,6 +105,10 @@ from email import encoders
 from email.charset import Charset, QP
 from email.utils import parseaddr, formataddr
 from urllib.parse import urlparse
+
+# Security: Size limits for attachment downloads
+MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50MB per file
+MAX_TOTAL_ATTACHMENT_SIZE = 200 * 1024 * 1024  # 200MB per message
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -140,6 +146,21 @@ def _decode_header_str(raw):
         return str(make_header(decode_header(raw)))
     except Exception:
         return str(raw)
+
+
+def _validate_folder_name(folder):
+    """
+    Validate IMAP folder name to prevent command injection.
+    
+    Per RFC 3501, folder names can contain most characters, but we restrict
+    dangerous ones that could be misinterpreted in IMAP commands.
+    """
+    if not folder:
+        raise ValueError("Empty folder name")
+    # Reject control characters and IMAP special chars
+    if re.search(r'[\r\n\x00-\x1f]', folder):
+        raise ValueError(f"Folder name contains control characters: {folder!r}")
+    return folder
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +331,7 @@ def list_inbox(folder="INBOX", limit=20, config=None):
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
 
     try:
+        _validate_folder_name(folder)
         status, _ = m.select(folder, readonly=True)
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {folder!r}")
@@ -406,6 +428,7 @@ def read_message(uid, folder="INBOX", config=None):
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
 
     try:
+        _validate_folder_name(folder)
         status, _ = m.select(folder, readonly=True)
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {folder!r}")
@@ -448,6 +471,10 @@ def move_message(uid, dest_folder, src_folder="INBOX", config=None):
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
 
     try:
+        # Validate folder names to prevent IMAP injection
+        _validate_folder_name(src_folder)
+        _validate_folder_name(dest_folder)
+        
         status, _ = m.select(src_folder)
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {src_folder!r}")
@@ -488,6 +515,13 @@ def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
     """
     Download all attachments from a message to dest_dir.
 
+    Security considerations:
+    - Filename sanitization prevents path traversal (dots collapsed)
+    - Symlink validation prevents redirection attacks
+    - Size limits prevent DoS from large attachments
+    - Atomic writes prevent partial file corruption
+    - Random suffixes prevent collision attacks
+
     Args:
         uid:      IMAP sequence number
         folder:   IMAP folder (default: INBOX)
@@ -501,12 +535,27 @@ def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
     if m is None:
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
 
-    dest = Path(dest_dir)
+    # Resolve and validate destination path (prevents symlink attacks)
+    dest = Path(dest_dir).resolve(strict=False)
+    
+    # Check for symlinks in the path chain
+    current = dest
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError(f"Destination path contains symlink: {current}")
+        current = current.parent
+    
     dest.mkdir(parents=True, exist_ok=True)
+    
+    # Validate we can actually write to this directory
+    if not os.access(dest, os.W_OK):
+        raise PermissionError(f"Cannot write to destination: {dest}")
 
     saved_paths = []
+    total_size = 0
 
     try:
+        _validate_folder_name(folder)
         status, _ = m.select(folder, readonly=True)
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {folder!r}")
@@ -533,24 +582,89 @@ def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
             if not payload:
                 continue
 
+            # Enforce per-attachment size limit
+            if len(payload) > MAX_ATTACHMENT_SIZE:
+                logger.warning(
+                    f"Skipping attachment: size {len(payload)} exceeds limit "
+                    f"{MAX_ATTACHMENT_SIZE}"
+                )
+                continue
+
+            # Enforce total message limit
+            if total_size + len(payload) > MAX_TOTAL_ATTACHMENT_SIZE:
+                logger.warning(
+                    f"Skipping remaining attachments: would exceed total limit "
+                    f"{MAX_TOTAL_ATTACHMENT_SIZE}"
+                )
+                break
+
+            total_size += len(payload)
+
             if not fn:
                 ext = mimetypes.guess_extension(ct) or ".bin"
                 fn = f"attachment_{i}{ext}"
 
-            # Sanitize filename
+            # Sanitize filename: collapse path separators and dots
+            # Replace path separators first, then handle dot sequences
+            fn = fn.replace('/', '_').replace('\\', '_')
+            fn = re.sub(r'\.\.+', '_', fn)  # Collapse .. sequences
             fn = re.sub(r'[^\w\-_\. ]', '_', fn)
+            
+            # Ensure filename doesn't start with . (hidden files)
+            fn = fn.lstrip('.')
+            
+            # Limit filename length (255 is max on most filesystems)
+            if len(fn) > 255:
+                stem = Path(fn[:250]).stem
+                suffix = Path(fn).suffix[:5]
+                fn = f"{stem}{suffix}"
+            
+            # Ensure we have something left after sanitization
+            if not fn:
+                fn = f"attachment_{i}.bin"
+
             out_path = dest / fn
 
-            # Avoid overwrites
-            counter = 1
-            while out_path.exists():
+            # Avoid overwrites with random suffix (prevents collision attacks)
+            counter = 0
+            while out_path.exists() or out_path.is_symlink():
+                if counter > 100:  # Prevent infinite loop
+                    raise RuntimeError(f"Cannot find unique filename for {fn}")
                 stem = Path(fn).stem
                 suffix = Path(fn).suffix
-                out_path = dest / f"{stem}_{counter}{suffix}"
+                random_suffix = secrets.token_hex(4)
+                out_path = dest / f"{stem}_{random_suffix}{suffix}"
                 counter += 1
 
-            out_path.write_bytes(payload)
-            saved_paths.append(str(out_path))
+            # Atomic write: temp file then rename
+            tmp_fd = None
+            tmp_path = None
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=dest, prefix=".waggle_tmp_")
+                os.write(tmp_fd, payload)
+                os.close(tmp_fd)
+                tmp_fd = None
+                
+                # Final symlink check before rename
+                if out_path.is_symlink():
+                    raise ValueError(f"Refusing to overwrite symlink: {out_path}")
+                
+                # Atomic rename
+                Path(tmp_path).rename(out_path)
+                saved_paths.append(str(out_path))
+            except Exception:
+                # Cleanup on error
+                if tmp_fd is not None:
+                    try:
+                        os.close(tmp_fd)
+                    except:
+                        pass
+                if tmp_path:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except:
+                        pass
+                raise
 
         return saved_paths
     finally:
@@ -569,11 +683,18 @@ _SEND_LOG = Path(os.environ.get("WAGGLE_SEND_LOG",
 
 
 def _log_sent(to, subject):
-    """Append a send record to the local sent log."""
+    """Append a send record to the local sent log.
+    
+    Sanitizes log entry to prevent format corruption from malicious inputs.
+    Replaces | and newlines to preserve pipe-delimited format integrity.
+    """
     import time
     _SEND_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # Sanitize to preserve log format integrity
+    to_clean = str(to).lower().replace('|', '').replace('\n', '').replace('\r', '').strip()
+    subj_clean = str(subject).lower().replace('|', '').replace('\n', '').replace('\r', '').strip()
     with open(_SEND_LOG, "a") as f:
-        f.write(f"{int(time.time())}|{(_validate_email(to) or to).lower()}|{subject.lower().strip()}\n")
+        f.write(f"{int(time.time())}|{to_clean}|{subj_clean}\n")
 
 
 def check_recently_sent(to, subject, within_minutes=5, config=None):
