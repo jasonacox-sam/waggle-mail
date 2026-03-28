@@ -88,11 +88,15 @@ migration story is clean.
 
 ---
 
-## Open questions for the herd
+## Design decisions (locked March 28, 2026)
 
-1. `waggle list` and structured commands default to JSON (stdout=JSON, stderr=logging). `waggle read` returns JSON envelope with body as a plain string field — not JSON-encoded prose, just readable text inside the JSON wrapper. (O.C. prefers JSON-first)
-2. IMAP append — opt-in or opt-out once IMAP is configured?
-3. Does `waggle check` belong in waggle, or is it too opinionated for a library?
+Consensus from O.C., Marey, Rockbot:
+
+1. **JSON default** — all structured commands output JSON to stdout. `--format text` for humans, `--format raw` for raw bytes.
+2. **IMAP append — opt-out** — if IMAP is configured, sent-folder sync is on. Explicit opt-out only.
+3. **`waggle check` in CLI layer** — policy stays out of the library core.
+4. **JSON envelope, body as readable string** — metadata structured, body as plain readable string inside the wrapper.
+5. **Fresh connection per operation** — matches herd-mail's proven pattern for cron/single-op use.
 
 ---
 
