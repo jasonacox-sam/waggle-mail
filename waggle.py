@@ -863,6 +863,8 @@ def fetch_quoted_body(message_id, config=None):
     from_hdr = str(make_header(decode_header(msg.get("From", "")  or "")))
     date_hdr = str(make_header(decode_header(msg.get("Date", "")  or "")))
     subj_hdr = str(make_header(decode_header(msg.get("Subject", "") or "")))
+    to_hdr   = str(make_header(decode_header(msg.get("To", "")    or "")))
+    cc_hdr   = str(make_header(decode_header(msg.get("Cc", "")    or "")))
 
     plain_body = html_body = None
     if msg.is_multipart():
@@ -885,24 +887,36 @@ def fetch_quoted_body(message_id, config=None):
             plain_body = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
 
     # --- Plain text quoted block (Outlook style, full body, no trimming) ---
-    attr_plain = (
-        f"-----Original Message-----\n"
-        f"From: {from_hdr}\n"
-        f"Sent: {date_hdr}\n"
-        f"Subject: {subj_hdr}"
-    )
+    attr_lines = [
+        "-----Original Message-----",
+        f"From: {from_hdr}",
+        f"Sent: {date_hdr}",
+    ]
+    if to_hdr:
+        attr_lines.append(f"To: {to_hdr}")
+    if cc_hdr:
+        attr_lines.append(f"Cc: {cc_hdr}")
+    attr_lines.append(f"Subject: {subj_hdr}")
+    attr_plain = "\n".join(attr_lines)
     if plain_body:
         quoted_plain = f"\n\n{attr_plain}\n\n{plain_body.strip()}"
     else:
         quoted_plain = f"\n\n{attr_plain}"
 
     # --- HTML quoted block (Outlook-style left-border blockquote) ---
+    attr_html_parts = [
+        f'<b>From:</b> {from_hdr}<br>',
+        f'<b>Sent:</b> {date_hdr}<br>',
+    ]
+    if to_hdr:
+        attr_html_parts.append(f'<b>To:</b> {to_hdr}<br>')
+    if cc_hdr:
+        attr_html_parts.append(f'<b>Cc:</b> {cc_hdr}<br>')
+    attr_html_parts.append(f'<b>Subject:</b> {subj_hdr}')
     attr_html = (
         f'<p style="margin:0 0 8px 0;font-size:12px;color:#777;">'
-        f'<b>From:</b> {from_hdr}<br>'
-        f'<b>Sent:</b> {date_hdr}<br>'
-        f'<b>Subject:</b> {subj_hdr}'
-        f'</p>'
+        + "".join(attr_html_parts)
+        + '</p>'
     )
     if html_body:
         inner = html_body
@@ -1115,9 +1129,9 @@ def _wrap_html_rich(body_html):
 <head>
 <meta charset="utf-8">
 <style>
-  body {{ font-family: Georgia, serif; font-size: 16px;
+  body {{ font-family: Aptos, Calibri, Arial, sans-serif; font-size: 16px;
          color: #222; max-width: 680px; margin: 40px auto; padding: 0 24px; }}
-  h1, h2, h3 {{ font-family: system-ui, sans-serif; }}
+  h1, h2, h3 {{ font-family: Aptos, Calibri, Arial, sans-serif; }}
   hr {{ border: none; border-top: 1px solid #ddd; margin: 32px 0; }}
   a {{ color: #2563eb; }}
   blockquote {{ border-left: 3px solid #ccc; margin: 0; padding: 0 0 0 16px;
