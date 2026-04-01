@@ -57,8 +57,8 @@ class TestMarkReadParameter:
             with pytest.raises(TypeError, match="mark_read"):
                 waggle.read_message("1", mark_read=bad_value, config=imap_config)
 
-    def test_mark_read_without_imap_configured(self):
-        """mark_read=True with no IMAP configured raises RuntimeError."""
+    def test_mark_read_without_imap_configured(self, caplog):
+        """mark_read=True with no IMAP logs warning, downgrades, then raises RuntimeError."""
         no_imap_config = {
             "imap_host": "",
             "imap_port": 993,
@@ -71,8 +71,11 @@ class TestMarkReadParameter:
             "from_name": "",
             "tls": True,
         }
-        with pytest.raises(RuntimeError, match="IMAP not configured"):
-            waggle.read_message("1", mark_read=True, config=no_imap_config)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="waggle"):
+            with pytest.raises(RuntimeError, match="IMAP not configured"):
+                waggle.read_message("1", mark_read=True, config=no_imap_config)
+        assert "mark_read=True ignored: IMAP not configured" in caplog.text
 
     def test_mark_read_with_invalid_uid(self, mock_imap, imap_config):
         """Invalid UID fails regardless of mark_read value."""

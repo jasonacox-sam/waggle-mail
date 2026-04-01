@@ -495,6 +495,11 @@ def read_message(uid, folder="INBOX", mark_read=False, config=None):
         raise TypeError(f"mark_read must be bool, got {type(mark_read).__name__}")
 
     cfg = _build_cfg(config)
+
+    if mark_read and not cfg.get("imap_host"):
+        logger.warning("mark_read=True ignored: IMAP not configured")
+        mark_read = False
+
     m, _ = _imap_connect(cfg)
     if m is None:
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
