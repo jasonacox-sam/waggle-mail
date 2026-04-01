@@ -85,6 +85,9 @@ Configuration (environment variables):
     WAGGLE_IMAP_PORT IMAP port (default: 993)
     WAGGLE_IMAP_TLS  Use IMAP SSL (default: true)
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
+
+    WAGGLE_SENT_FOLDER  IMAP Sent folder (default: auto-detect).
+                        Auto-detection tries: "Sent", "Sent Items", "INBOX.Sent"
 """
 
 __version__ = "1.8.6"
@@ -227,16 +230,17 @@ def _build_cfg(config=None):
     """Merge explicit config dict with environment variable fallbacks."""
     cfg = config or {}
     return {
-        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or os.environ.get("WAGGLE_HOST", ""),
-        "imap_port":  int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT", "993")),
-        "imap_tls":   cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", "true").lower() != "false"),
-        "user":       cfg.get("user")       or os.environ.get("WAGGLE_USER", ""),
-        "password":   cfg.get("password")   or os.environ.get("WAGGLE_PASS", ""),
-        "host":       cfg.get("host")       or os.environ.get("WAGGLE_HOST", "localhost"),
-        "port":       int(cfg.get("port")   or os.environ.get("WAGGLE_PORT", "465")),
-        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM", cfg.get("user") or os.environ.get("WAGGLE_USER", "")),
-        "from_name":  cfg.get("from_name")  or os.environ.get("WAGGLE_NAME", ""),
-        "tls":        cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false"),
+        "imap_host":   cfg.get("imap_host")   or os.environ.get("WAGGLE_IMAP_HOST") or os.environ.get("WAGGLE_HOST", ""),
+        "imap_port":   int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT", "993")),
+        "imap_tls":    cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", "true").lower() != "false"),
+        "user":        cfg.get("user")        or os.environ.get("WAGGLE_USER", ""),
+        "password":    cfg.get("password")    or os.environ.get("WAGGLE_PASS", ""),
+        "host":        cfg.get("host")        or os.environ.get("WAGGLE_HOST", "localhost"),
+        "port":        int(cfg.get("port")    or os.environ.get("WAGGLE_PORT", "465")),
+        "from_addr":   cfg.get("from_addr")   or os.environ.get("WAGGLE_FROM", cfg.get("user") or os.environ.get("WAGGLE_USER", "")),
+        "from_name":   cfg.get("from_name")   or os.environ.get("WAGGLE_NAME", ""),
+        "tls":         cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false"),
+        "sent_folder": cfg.get("sent_folder") or os.environ.get("WAGGLE_SENT_FOLDER", ""),
     }
 
 
@@ -251,6 +255,71 @@ def _imap_connect(cfg):
         m = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
     m.login(cfg["user"], cfg["password"])
     return m, cfg["imap_host"]
+
+
+# Try common Sent folder names in order of modern prevalence
+_SENT_FOLDER_CANDIDATES = (
+    "Sent",        # Gmail, modern IMAP servers
+    "Sent Items",  # Outlook/Microsoft Exchange
+    "INBOX.Sent",  # Courier, older hierarchical IMAP
+)
+
+
+def _imap_append_sent(cfg, msg_bytes, folder=None):
+    """
+    Append a sent message to the IMAP Sent folder.
+
+    Args:
+        cfg:       Config dict from _build_cfg().
+        msg_bytes: RFC822 message as bytes.
+        folder:    Explicit folder name, or None for auto-detect.
+
+    Returns:
+        The folder name used, or None on failure.
+    """
+    if not msg_bytes or not isinstance(msg_bytes, bytes):
+        logger.warning("Invalid message bytes for IMAP append")
+        return None
+
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        return None
+
+    try:
+        # Explicit folder provided
+        if folder:
+            _validate_folder_name(folder)
+            try:
+                status, _ = m.append(folder, r"(\Seen)", None, msg_bytes)
+                if status == "OK":
+                    return folder
+            except Exception as exc:
+                logger.warning(f"IMAP append to {folder!r} failed: {exc}")
+                return None
+
+        # Auto-detect: try candidates in order
+        for candidate in _SENT_FOLDER_CANDIDATES:
+            try:
+                # Verify folder exists
+                status, _ = m.select(candidate, readonly=True)
+                if status != "OK":
+                    continue
+                m.close()  # Close the selected folder
+
+                # Append to this folder
+                status, _ = m.append(candidate, r"(\Seen)", None, msg_bytes)
+                if status == "OK":
+                    return candidate
+            except Exception:
+                continue
+
+        logger.warning("No suitable Sent folder found")
+        return None
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
 
 
 def _imap_find_uid(m, mid):
@@ -1169,6 +1238,8 @@ def send_email(
     attachments=None,
     rich=False,
     config=None,
+    save_sent=True,
+    sent_folder=None,
 ):
     """
     Send a multipart email rendered from Markdown.
@@ -1188,7 +1259,17 @@ def send_email(
         attachments:  List of file paths to attach.
         rich:         Enable rich HTML rendering (opt-in, stripped by Gmail).
         config:       Config dict (falls back to env vars).
+        save_sent:    If True (default), append sent message to IMAP Sent folder.
+                      Requires IMAP configuration. Silently skips if IMAP unavailable.
+        sent_folder:  Explicit IMAP Sent folder name, or None for auto-detect.
+                      Auto-detection tries: "Sent", "Sent Items", "INBOX.Sent"
     """
+    # Validate new parameters before any side effects
+    if not isinstance(save_sent, bool):
+        raise TypeError(f"save_sent must be bool, got {type(save_sent).__name__}")
+    if sent_folder is not None and not isinstance(sent_folder, str):
+        raise TypeError(f"sent_folder must be str or None, got {type(sent_folder).__name__}")
+
     cfg = _build_cfg(config)
 
     quoted_plain = quoted_html = None
@@ -1276,6 +1357,14 @@ def send_email(
             if cfg["user"] and cfg["password"]:
                 s.login(cfg["user"], cfg["password"])
             s.sendmail(envelope_from, envelope_to, msg.as_string())
+
+    # IMAP Sent folder sync
+    if save_sent and cfg.get("imap_host"):
+        try:
+            folder = sent_folder or cfg.get("sent_folder") or None
+            _imap_append_sent(cfg, msg.as_bytes(), folder=folder)
+        except Exception as exc:
+            logger.warning(f"Sent folder append failed (SMTP succeeded, message delivered): {exc}")
 
     # Log the send so check_recently_sent() can detect duplicates
     _log_sent(to, subject)
@@ -1374,6 +1463,7 @@ def _cli_send(args):
         from_name=getattr(args, "from_name", None),
         attachments=getattr(args, "attach", None),
         rich=getattr(args, "rich", False),
+        save_sent=not getattr(args, "no_save_sent", False),
     )
     print(f"✅ Sent to {args.to}")
 
@@ -1425,6 +1515,8 @@ def main():
     p_send.add_argument("--references",  default=None)
     p_send.add_argument("--attach",      action="append", default=None, metavar="FILE")
     p_send.add_argument("--rich",        action="store_true", default=False)
+    p_send.add_argument("--no-save-sent", action="store_true", default=False,
+                        help="Skip saving to IMAP Sent folder")
 
     args = parser.parse_args()
 
