@@ -31,6 +31,7 @@ The library stays focused. The CLI makes it accessible to cron jobs, shell scrip
 | `waggle check` | Check for unread — exit 0 if unread, 1 if none, 2 if error |
 | `waggle move <uid> <folder>` | Move a message between folders |
 | `waggle attach <uid>` | Download attachments, print paths as JSON |
+| `waggle flag <uid> +Seen -Flagged` | Manage IMAP flags (depends on Issue #5 set_flags/clear_flags API) |
 
 ### Output contract
 
