@@ -52,6 +52,8 @@ After every SMTP send, append the sent message to `INBOX.Sent` via IMAP.
 - Configurable: `WAGGLE_IMAP_APPEND=true` (default: true if IMAP is configured)
 - This was the #1 pain point O.C. identified in the herd email poll
 
+- `waggle read --mark-read` — automatically set \Seen flag when reading (Issue #6)
+
 ### Implementation plan
 
 1. Refactor `__main__.py` to use argparse subcommands (currently monolithic)

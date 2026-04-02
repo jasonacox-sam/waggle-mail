@@ -17,6 +17,7 @@ Usage (CLI — subcommands):
     # Read a message (prints body + threading headers + reply template)
     waggle read 42
     waggle read 42 --folder INBOX.Processed
+    waggle read 42 --mark-read          # mark as read (\\Seen) on server
 
     # Move a message between folders
     waggle move 42 INBOX.Processed
@@ -47,10 +48,13 @@ Usage (Python API):
     for m in messages:
         print(m["uid"], m["from"], m["subject"], m["date"])
 
-    # Read a message
+    # Read a message (without marking as read)
     msg = read_message("42", folder="INBOX")
     print(msg["body_plain"])
     print(msg["message_id"])   # use for in_reply_to
+
+    # Read and mark as seen on the server
+    msg = read_message("42", mark_read=True)
 
     # Reply
     send_email(
@@ -458,7 +462,7 @@ def list_inbox(folder="INBOX", limit=20, config=None):
             pass
 
 
-def read_message(uid, folder="INBOX", config=None):
+def read_message(uid, folder="INBOX", mark_read=False, config=None):
     """
     Read a full email message by IMAP sequence number / UID.
 
@@ -466,9 +470,11 @@ def read_message(uid, folder="INBOX", config=None):
     Use msg["message_id"] and msg["reply_references"] for waggle send_email().
 
     Args:
-        uid:    IMAP sequence number (as string or int)
-        folder: IMAP folder (default: INBOX)
-        config: Optional config dict
+        uid:       IMAP sequence number (as string or int)
+        folder:    IMAP folder (default: INBOX)
+        mark_read: If True, mark the message as read (\\Seen) on the server.
+                   Default False preserves existing behavior (BODY.PEEK[], readonly).
+        config:    Optional config dict
 
     Returns dict keys:
         uid, folder, message_id, references, in_reply_to, reply_references,
@@ -477,20 +483,36 @@ def read_message(uid, folder="INBOX", config=None):
 
     Note: attachments list contains metadata only — call download_attachments()
     to save files to disk.
+
+    Examples:
+        # Read without marking as read (default)
+        msg = read_message("42")
+
+        # Read and mark as seen on the server
+        msg = read_message("42", mark_read=True)
     """
+    if not isinstance(mark_read, bool):
+        raise TypeError(f"mark_read must be bool, got {type(mark_read).__name__}")
+
     cfg = _build_cfg(config)
+
+    if mark_read and not cfg.get("imap_host"):
+        logger.warning("mark_read=True ignored: IMAP not configured")
+        mark_read = False
+
     m, _ = _imap_connect(cfg)
     if m is None:
         raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
 
     try:
         _validate_folder_name(folder)
-        status, _ = m.select(folder, readonly=True)
+        status, _ = m.select(folder, readonly=not mark_read)
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {folder!r}")
 
         uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
-        typ, data = m.fetch(uid_bytes, "(BODY.PEEK[])")
+        fetch_cmd = "(BODY[])" if mark_read else "(BODY.PEEK[])"
+        typ, data = m.fetch(uid_bytes, fetch_cmd)
         if typ != "OK" or not data or data[0] is None:
             raise RuntimeError(f"Message {uid} not found in {folder}")
 
@@ -1309,7 +1331,7 @@ def _cli_list(args):
 
 
 def _cli_read(args):
-    msg = read_message(args.uid, folder=args.folder)
+    msg = read_message(args.uid, folder=args.folder, mark_read=args.mark_read)
     print("=" * 70)
     print(f"From:    {msg['from_raw']}")
     print(f"To:      {msg['to']}")
@@ -1399,6 +1421,8 @@ def main():
     p_read = sub.add_parser("read", help="Read a message (body + threading headers)")
     p_read.add_argument("uid", help="IMAP sequence number")
     p_read.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+    p_read.add_argument("--mark-read", action="store_true", default=False,
+                        help="Mark message as read (\\Seen) on the server")
 
     # --- move ---
     p_move = sub.add_parser("move", help="Move a message to another folder")
