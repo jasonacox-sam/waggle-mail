@@ -34,12 +34,6 @@ htmlcov/
 *.swo
 *~
 
-# Plans (local only)
-.plans/
-
-# Trycycle worktrees
-.worktrees/
-
 # OS
 .DS_Store
 Thumbs.db
