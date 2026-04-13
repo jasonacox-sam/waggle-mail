@@ -40,7 +40,7 @@ Usage (CLI — subcommands):
 
 Usage (Python API):
 
-    from waggle import send_email, reply_all, reply, list_inbox, read_message, move_message, download_attachments
+    from waggle import send_email, reply_all, reply, list_inbox, read_message, move_message, download_attachments, set_flags, clear_flags
 
     # List inbox
     messages = list_inbox(folder="INBOX", limit=20)
@@ -66,6 +66,10 @@ Usage (Python API):
 
     # Download attachments
     paths = download_attachments("42", folder="INBOX", dest_dir="/tmp/attachments/")
+
+    # Flag management
+    set_flags("42", [r"\\Seen", r"\\Flagged"])
+    clear_flags("42", [r"\\Flagged"])
 
 Configuration (environment variables):
     WAGGLE_HOST      SMTP host (default: localhost)
@@ -115,6 +119,15 @@ from urllib.parse import urlparse
 MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50MB per file
 MAX_TOTAL_ATTACHMENT_SIZE = 200 * 1024 * 1024  # 200MB per message
 
+# IMAP flag whitelist (RFC 3501 section 2.3.2 system flags)
+ALLOWED_FLAGS = frozenset({
+    r"\Seen",
+    r"\Answered",
+    r"\Flagged",
+    r"\Draft",
+    r"\Deleted",
+})
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -156,7 +169,7 @@ def _decode_header_str(raw):
 def _validate_folder_name(folder):
     """
     Validate IMAP folder name to prevent command injection.
-    
+
     Per RFC 3501, folder names can contain most characters, but we restrict
     dangerous ones that could be misinterpreted in IMAP commands.
     """
@@ -166,6 +179,20 @@ def _validate_folder_name(folder):
     if re.search(r'[\r\n\x00-\x1f]', folder):
         raise ValueError(f"Folder name contains control characters: {folder!r}")
     return folder
+
+
+def _validate_flags(flags):
+    """
+    Validate flag list against whitelist.
+
+    Raises:
+        ValueError: Empty flags list or unknown flag.
+    """
+    if not flags:
+        raise ValueError("flags list cannot be empty")
+    for flag in flags:
+        if flag not in ALLOWED_FLAGS:
+            raise ValueError(f"Unknown IMAP flag: {flag!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +617,106 @@ def move_message(uid, dest_folder, src_folder="INBOX", config=None):
             m.logout()
         except Exception:
             pass
+
+
+def _modify_flags(uid, flags, action, folder, config, operation_name):
+    """
+    Internal helper for flag modifications.
+
+    Args:
+        uid:            Message UID or comma-separated UIDs.
+        flags:          List of IMAP flags.
+        action:         "+FLAGS" or "-FLAGS".
+        folder:         IMAP folder name.
+        config:         Config dict.
+        operation_name: Function name for error messages.
+
+    Returns:
+        True on success.
+
+    Raises:
+        ValueError:   Invalid flag, UID, or folder.
+        RuntimeError: IMAP not configured or STORE failed.
+    """
+    _validate_flags(flags)
+
+    # Validate each UID in comma-separated list
+    uid_list = []
+    for part in str(uid).split(","):
+        part = part.strip()
+        if not part.isdigit() or int(part) <= 0:
+            raise ValueError(f"Invalid UID: {part!r}")
+        uid_list.append(part)
+
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    try:
+        _validate_folder_name(folder)
+        status, _ = m.select(folder)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {folder!r}")
+
+        flag_str = "(%s)" % " ".join(flags)
+
+        for uid_str in uid_list:
+            uid_bytes = uid_str.encode()
+            status, _ = m.uid("STORE", uid_bytes, action, flag_str)
+            if status != "OK":
+                raise RuntimeError(f"{operation_name} failed for UID {uid_str}: {status}")
+
+        return True
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def set_flags(uid, flags, folder="INBOX", config=None):
+    """
+    Add IMAP flags to a message.
+
+    Args:
+        uid:    Message UID (str, as returned by list_inbox/read_message).
+                Comma-separated UIDs for bulk operations (e.g. "42,43,44").
+        flags:  List of IMAP flags to add (e.g. [r"\\Seen", r"\\Flagged"]).
+        folder: IMAP folder (default: INBOX).
+        config: Optional config dict (falls back to env vars).
+
+    Returns:
+        True on success. For bulk UIDs, all operations must succeed.
+
+    Raises:
+        ValueError:    Unknown flag, invalid UID, or empty flags list.
+        RuntimeError:  IMAP not configured or STORE command failed.
+                       For bulk operations, stops at the first failure (fail-fast).
+    """
+    return _modify_flags(uid, flags, "+FLAGS", folder, config, "set_flags")
+
+
+def clear_flags(uid, flags, folder="INBOX", config=None):
+    """
+    Remove IMAP flags from a message.
+
+    Args:
+        uid:    Message UID (str, as returned by list_inbox/read_message).
+                Comma-separated UIDs for bulk operations (e.g. "42,43,44").
+        flags:  List of IMAP flags to remove (e.g. [r"\\Seen", r"\\Flagged"]).
+        folder: IMAP folder (default: INBOX).
+        config: Optional config dict (falls back to env vars).
+
+    Returns:
+        True on success. For bulk UIDs, all operations must succeed.
+
+    Raises:
+        ValueError:    Unknown flag, invalid UID, or empty flags list.
+        RuntimeError:  IMAP not configured or STORE command failed.
+                       For bulk operations, stops at the first failure (fail-fast).
+    """
+    return _modify_flags(uid, flags, "-FLAGS", folder, config, "clear_flags")
 
 
 def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
