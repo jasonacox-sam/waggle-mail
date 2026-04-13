@@ -40,7 +40,7 @@ Usage (CLI — subcommands):
 
 Usage (Python API):
 
-    from waggle import send_email, list_inbox, read_message, move_message, download_attachments
+    from waggle import send_email, reply_all, reply, list_inbox, read_message, move_message, download_attachments
 
     # List inbox
     messages = list_inbox(folder="INBOX", limit=20)
@@ -87,7 +87,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.8.6"
+__version__ = "1.9.0"
 
 import os
 import re
@@ -108,7 +108,7 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 from email.charset import Charset, QP
-from email.utils import parseaddr, formataddr
+from email.utils import parseaddr, formataddr, getaddresses
 from urllib.parse import urlparse
 
 # Security: Size limits for attachment downloads
@@ -303,6 +303,7 @@ def _parse_message(raw_bytes):
     subject     = _decode_header_str(msg.get("Subject", ""))
     date        = _decode_header_str(msg.get("Date", ""))
     to          = _decode_header_str(msg.get("To", ""))
+    cc          = _decode_header_str(msg.get("Cc", ""))
 
     body_plain = None
     body_html  = None
@@ -347,6 +348,24 @@ def _parse_message(raw_bytes):
 
     reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
+    # Build reply_cc: everyone on To + Cc except the original sender (they go in To)
+    # Caller should also remove their own address before sending.
+    _all_recipients = []
+    for field in (to, cc):
+        if field:
+            for name_part, addr_part in getaddresses([field]):
+                addr_part = addr_part.strip().lower()
+                if addr_part and addr_part != from_addr_p.lower():
+                    _all_recipients.append(addr_part)
+    # Deduplicate while preserving order
+    _seen = set()
+    reply_cc_list = []
+    for addr in _all_recipients:
+        if addr not in _seen:
+            _seen.add(addr)
+            reply_cc_list.append(addr)
+    reply_cc = ", ".join(reply_cc_list)  # comma-separated, ready for send_email(cc=...)
+
     return {
         "message_id":       message_id,
         "references":       references,
@@ -357,6 +376,8 @@ def _parse_message(raw_bytes):
         "from_name":        from_name_p,
         "from_raw":         from_raw,
         "to":               to,
+        "cc":               cc,
+        "reply_cc":         reply_cc,
         "subject":          subject,
         "date":             date,
         "body_plain":       body_plain,
@@ -472,8 +493,12 @@ def read_message(uid, folder="INBOX", config=None):
 
     Returns dict keys:
         uid, folder, message_id, references, in_reply_to, reply_references,
-        reply_subject, from_addr, from_name, from_raw, to, subject, date,
-        body_plain, body_html, attachments (list of {filename, content_type, size})
+        reply_subject, from_addr, from_name, from_raw, to, cc, reply_cc,
+        subject, date, body_plain, body_html, attachments (list of {filename, content_type, size})
+
+        reply_cc: comma-separated addresses of all original recipients except the
+        sender — ready to pass directly to send_email(cc=msg['reply_cc']).
+        Or just use reply_all(msg, body_md) and waggle handles it automatically.
 
     Note: attachments list contains metadata only — call download_attachments()
     to save files to disk.
@@ -1281,6 +1306,93 @@ def send_email(
     _log_sent(to, subject)
 
 
+def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+    """
+    Reply-all to a message returned by read_message().
+
+    Automatically:
+    - Sets To: to the original sender
+    - Sets Cc: to everyone else on the original To + Cc, minus your own address
+    - Sets Subject, In-Reply-To, and References for proper threading
+    - Strips your own from_addr from the CC list
+
+    This is the default reply mode — use it whenever the original message
+    had multiple recipients. Use reply() only when you explicitly want to
+    reply to the sender alone.
+
+    Args:
+        msg:         Message dict as returned by read_message().
+        body_md:     Your reply body in Markdown.
+        from_name:   Optional display name override.
+        attachments: Optional list of file paths to attach.
+        rich:        Enable rich HTML rendering (opt-in).
+        config:      Optional config dict.
+
+    Example:
+        msg = read_message("42")
+        reply_all(msg, body_md="Thanks for the note — here's my response.")
+    """
+    cfg = _build_cfg(config)
+    own_addr = cfg["from_addr"].strip().lower()
+
+    # Build CC: everyone on the original thread except the sender (goes to To)
+    # and except ourselves
+    reply_cc = msg.get("reply_cc", "")
+    if reply_cc:
+        # Filter out our own address in case it appears
+        filtered = [
+            addr.strip() for addr in reply_cc.split(",")
+            if addr.strip() and addr.strip().lower() != own_addr
+        ]
+        reply_cc = ", ".join(filtered)
+
+    send_email(
+        to=msg["from_addr"],
+        subject=msg["reply_subject"],
+        body_md=body_md,
+        cc=reply_cc or None,
+        in_reply_to=msg["message_id"],
+        references=msg["reply_references"],
+        from_name=from_name,
+        attachments=attachments,
+        rich=rich,
+        config=config,
+    )
+
+
+def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+    """
+    Reply directly to the sender of a message — no CC.
+
+    Use this only when you explicitly want a private reply to the sender alone
+    (e.g. they asked "just reply to me"). For any message with CC recipients,
+    prefer reply_all().
+
+    Args:
+        msg:         Message dict as returned by read_message().
+        body_md:     Your reply body in Markdown.
+        from_name:   Optional display name override.
+        attachments: Optional list of file paths to attach.
+        rich:        Enable rich HTML rendering (opt-in).
+        config:      Optional config dict.
+
+    Example:
+        msg = read_message("42")
+        reply(msg, body_md="Just between us — here's my answer.")
+    """
+    send_email(
+        to=msg["from_addr"],
+        subject=msg["reply_subject"],
+        body_md=body_md,
+        in_reply_to=msg["message_id"],
+        references=msg["reply_references"],
+        from_name=from_name,
+        attachments=attachments,
+        rich=rich,
+        config=config,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1325,23 +1437,21 @@ def _cli_read(args):
     print(msg["body_plain"] or "(no plain text body)")
     print()
     print("─" * 70)
-    print("THREADING — use these for waggle send_email() reply:")
+    print("THREADING — use these for reply:")
     print(f"  message_id       = {msg['message_id'] or '(none)'}")
     print(f"  reply_references = {msg['reply_references'] or '(none)'}")
     print(f"  reply_subject    = {msg['reply_subject']}")
+    if msg.get('reply_cc'):
+        print(f"  reply_cc         = {msg['reply_cc']}")
     print()
-    print("PYTHON REPLY TEMPLATE:")
+    print("PYTHON REPLY TEMPLATE (reply_all — recommended):")
     print("  import sys")
     print("  sys.path.insert(0, '/home/jason/.openclaw/workspace/projects/waggle')")
-    print("  from waggle import send_email, move_message")
-    print("  send_email(")
-    print(f'      to="{msg["from_addr"]}",')
-    print(f'      subject="{msg["reply_subject"]}",')
-    print(f'      body_md="""YOUR REPLY HERE""",')
-    print(f'      in_reply_to="{msg["message_id"]}",')
-    print(f'      references="{msg["reply_references"]}",')
-    print(f'      from_name="Sam",')
-    print(f'  )')
+    print("  from waggle import reply_all, reply, move_message")
+    print("  # Reply-all (keeps everyone on the thread):")
+    print("  reply_all(msg, body_md=\"\"\"YOUR REPLY HERE\"\"\")")
+    print("  # Direct reply to sender only:")
+    print("  reply(msg, body_md=\"\"\"YOUR REPLY HERE\"\"\")")
     print(f'  move_message("{msg["uid"]}", "INBOX.Processed", "{msg["folder"]}")')
     print("─" * 70)
 
