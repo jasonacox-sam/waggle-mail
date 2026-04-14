@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 import os
 import re
@@ -1334,7 +1334,7 @@ def _wrap_html_simple(body_html):
 
 def _md_to_html_rich(text):
     import markdown as md_lib
-    extensions = ["extra", "codehilite", "tables", "fenced_code", "nl2br"]
+    extensions = ["extra", "codehilite", "tables", "fenced_code"]
     ext_configs = {"codehilite": {"noclasses": True, "guess_lang": False}}
     try:
         html = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
@@ -1366,6 +1366,9 @@ def _wrap_html_rich(body_html):
   th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
   th {{ background: #f4f4f4; }}
   pre {{ font-family:'SF Mono','Fira Code',Consolas,monospace; font-size:12px; }}
+  ol, ul {{ margin: 8px 0 8px 0; padding-left: 24px; }}
+  li {{ margin: 4px 0; }}
+  ol ol, ul ul, ol ul, ul ol {{ margin: 2px 0; }}
 </style>
 </head>
 <body>
