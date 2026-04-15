@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.4"
+__version__ = "1.9.5"
 
 import os
 import re
@@ -142,9 +142,12 @@ _UTF8_QP.body_encoding = QP
 def _sanitize_header(value):
     if value is None:
         return None
-    if re.search(r'[\r\n]', str(value)):
+    # Unfold RFC 2822 folded headers (CRLF + whitespace → single space)
+    value = re.sub(r'\r\n[ \t]+', ' ', str(value))
+    value = re.sub(r'\n[ \t]+', ' ', value)
+    if re.search(r'[\r\n]', value):
         raise ValueError(f"Header value contains illegal newline characters: {value!r}")
-    return str(value)
+    return value
 
 
 def _validate_email(addr):
