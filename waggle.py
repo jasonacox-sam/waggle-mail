@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.5"
+__version__ = "1.9.7"
 
 import os
 import re
@@ -370,7 +370,7 @@ def _imap_find_uid(m, mid):
             status, _ = m.select(folder, readonly=True)
             if status != "OK":
                 continue
-            status, data = m.search(None, f'HEADER Message-ID "{mid}"')
+            status, data = m.uid("SEARCH", None, f'HEADER Message-ID "{mid}"')
             if status == "OK" and data and data[0]:
                 uids = data[0].split()
                 if uids:
@@ -506,7 +506,7 @@ def list_inbox(folder="INBOX", limit=20, config=None):
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {folder!r}")
 
-        status, data = m.search(None, "ALL")
+        status, data = m.uid("SEARCH", None, "ALL")
         if status != "OK" or not data[0]:
             return []
 
@@ -517,7 +517,7 @@ def list_inbox(folder="INBOX", limit=20, config=None):
         results = []
         for uid in uids:
             try:
-                _, msg_data = m.fetch(uid, "(FLAGS RFC822.SIZE BODY[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])")
+                _, msg_data = m.uid("FETCH", uid, "(FLAGS RFC822.SIZE BODY[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])")
                 if not msg_data or msg_data[0] is None:
                     continue
                 raw_headers = b""
@@ -574,13 +574,13 @@ def list_inbox(folder="INBOX", limit=20, config=None):
 
 def read_message(uid, folder="INBOX", mark_read=False, config=None):
     """
-    Read a full email message by IMAP sequence number / UID.
+    Read a full email message by IMAP UID.
 
     Returns a structured dict with body, headers, threading info, and attachment list.
     Use msg["message_id"] and msg["reply_references"] for waggle send_email().
 
     Args:
-        uid:       IMAP sequence number (as string or int)
+        uid:       IMAP UID (stable integer, as returned by list_inbox/search_messages)
         folder:    IMAP folder (default: INBOX)
         mark_read: If True, mark the message as read (\\Seen) on the server.
                    Default False preserves existing behavior (BODY.PEEK[], readonly=True).
@@ -619,7 +619,7 @@ def read_message(uid, folder="INBOX", mark_read=False, config=None):
 
         uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
         fetch_cmd = "(BODY[])" if mark_read else "(BODY.PEEK[])"
-        typ, data = m.fetch(uid_bytes, fetch_cmd)
+        typ, data = m.uid("FETCH", uid_bytes, fetch_cmd)
         if typ != "OK" or not data or data[0] is None:
             raise RuntimeError(f"Message {uid} not found in {folder}")
 
@@ -635,15 +635,136 @@ def read_message(uid, folder="INBOX", mark_read=False, config=None):
             pass
 
 
+def search_messages(query, folders=None, limit=20, config=None):
+    """
+    Search for messages across one or more folders by FROM, SUBJECT, or TEXT.
+
+    Returns a list of dicts (same shape as list_inbox) with an extra "folder" key
+    so the caller always knows which folder the UID belongs to.
+
+    Args:
+        query:   dict with one or more IMAP criteria keys:
+                   from_addr  → search FROM header  (e.g. "jamie@coder.com")
+                   subject    → search SUBJECT header (e.g. "Tavant")
+                   text       → full-text BODY search
+                   since      → date string e.g. "17-Apr-2026"
+                   unseen     → True  → only unread messages
+        folders: list of folder names to search (default: ["INBOX", "INBOX.Processed"])
+        limit:   max results per folder (default: 20)
+        config:  optional config dict
+
+    Returns list of message envelope dicts with added key:
+        folder   → the IMAP folder the message lives in
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    if folders is None:
+        folders = ["INBOX", "INBOX.Processed"]
+
+    # Build IMAP search criteria list
+    criteria = []
+    if query.get("unseen"):
+        criteria.append("UNSEEN")
+    if query.get("from_addr"):
+        criteria += ["FROM", f'"{query["from_addr"]}"']
+    if query.get("subject"):
+        criteria += ["SUBJECT", f'"{query["subject"]}"']
+    if query.get("text"):
+        criteria += ["TEXT", f'"{query["text"]}"']
+    if query.get("since"):
+        criteria += ["SINCE", query["since"]]
+    if not criteria:
+        criteria = ["ALL"]
+
+    results = []
+    try:
+        for folder in folders:
+            try:
+                _validate_folder_name(folder)
+                status, _ = m.select(folder, readonly=True)
+                if status != "OK":
+                    continue
+
+                status, data = m.uid("SEARCH", None, *criteria)
+                if status != "OK" or not data[0]:
+                    continue
+
+                uids = data[0].split()
+                uids = uids[-limit:][::-1]  # most recent first
+
+                for uid in uids:
+                    try:
+                        _, msg_data = m.uid("FETCH", uid, "(FLAGS RFC822.SIZE BODY[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])")
+                        if not msg_data or msg_data[0] is None:
+                            continue
+                        raw_headers = b""
+                        flags_str = ""
+                        size = 0
+                        for part in msg_data:
+                            if isinstance(part, tuple):
+                                info = part[0].decode() if isinstance(part[0], bytes) else str(part[0])
+                                if "FLAGS" in info:
+                                    flags_match = re.search(r'FLAGS \(([^)]*)\)', info)
+                                    if flags_match:
+                                        flags_str = flags_match.group(1)
+                                    size_match = re.search(r'RFC822\.SIZE (\d+)', info)
+                                    if size_match:
+                                        size = int(size_match.group(1))
+                                raw_headers = part[1] if isinstance(part[1], bytes) else b""
+
+                        message_id = from_raw = subject = date = ""
+                        for line in raw_headers.decode("utf-8", errors="replace").splitlines():
+                            lower = line.lower()
+                            if lower.startswith("message-id:"):
+                                message_id = _decode_header_str(line.split(":", 1)[1].strip())
+                            elif lower.startswith("from:"):
+                                from_raw = _decode_header_str(line.split(":", 1)[1].strip())
+                            elif lower.startswith("subject:"):
+                                subject = _decode_header_str(line.split(":", 1)[1].strip())
+                            elif lower.startswith("date:"):
+                                date = line.split(":", 1)[1].strip()
+
+                        from_name_p, from_addr_p = parseaddr(from_raw)
+                        results.append({
+                            "uid":        uid.decode() if isinstance(uid, bytes) else str(uid),
+                            "folder":     folder,
+                            "message_id": message_id,
+                            "from_addr":  from_addr_p,
+                            "from_name":  from_name_p,
+                            "from_raw":   from_raw,
+                            "subject":    subject,
+                            "date":       date,
+                            "flags":      flags_str,
+                            "size":       size,
+                            "unread":     r"\Seen" not in flags_str,
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error fetching envelope for uid {uid} in {folder}: {e}")
+                        continue
+            except Exception as e:
+                logger.warning(f"Error searching folder {folder!r}: {e}")
+                continue
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+    return results
+
+
 def move_message(uid, dest_folder, src_folder="INBOX", config=None):
     """
     Move a message from src_folder to dest_folder.
 
-    Uses UID COPY + UID STORE + EXPUNGE so sequence number shifts don't matter.
+    Uses UID COPY + UID STORE + EXPUNGE — stable, immune to concurrent folder changes.
     Use this after sending a reply: move_message("42", "INBOX.Processed")
 
     Args:
-        uid:         IMAP sequence number or UID (as returned by list_inbox/read_message)
+        uid:         IMAP UID (as returned by list_inbox/search_messages/read_message)
         dest_folder: Target folder (e.g. "INBOX.Processed")
         src_folder:  Source folder (default: INBOX)
         config:      Optional config dict
@@ -664,19 +785,8 @@ def move_message(uid, dest_folder, src_folder="INBOX", config=None):
         if status != "OK":
             raise RuntimeError(f"Could not select folder: {src_folder!r}")
 
-        seq = str(uid)
-
-        # First resolve to a real UID via UID SEARCH on the sequence number
-        # This makes the operation immune to sequence-number shifts from prior expunges
-        status, data = m.fetch(seq, "(UID)")
-        real_uid = seq  # fallback
-        if status == "OK" and data and data[0]:
-            raw = data[0].decode() if isinstance(data[0], bytes) else str(data[0])
-            m_uid = re.search(r'UID (\d+)', raw)
-            if m_uid:
-                real_uid = m_uid.group(1)
-
-        uid_bytes = real_uid.encode() if isinstance(real_uid, str) else real_uid
+        # uid is already a real UID (as returned by list_inbox/search_messages)
+        uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
 
         # UID COPY to destination
         status, _ = m.uid("COPY", uid_bytes, dest_folder)
@@ -808,7 +918,7 @@ def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
     - Random suffixes prevent collision attacks
 
     Args:
-        uid:      IMAP sequence number
+        uid:      IMAP UID (as returned by list_inbox/search_messages)
         folder:   IMAP folder (default: INBOX)
         dest_dir: Directory to save files (created if needed)
         config:   Optional config dict
@@ -846,7 +956,7 @@ def download_attachments(uid, folder="INBOX", dest_dir=".", config=None):
             raise RuntimeError(f"Could not select folder: {folder!r}")
 
         uid_bytes = str(uid).encode() if not isinstance(uid, bytes) else uid
-        typ, data = m.fetch(uid_bytes, "(BODY.PEEK[])")
+        typ, data = m.uid("FETCH", uid_bytes, "(BODY.PEEK[])")
         if typ != "OK" or not data or data[0] is None:
             raise RuntimeError(f"Message {uid} not found in {folder}")
 
@@ -1075,7 +1185,7 @@ def fetch_quoted_body(message_id, config=None):
 
             # Re-select the folder (find may have left us somewhere else)
             m.select(folder, readonly=True)
-            typ, data = m.fetch(uid, "(BODY.PEEK[])")
+            typ, data = m.uid("FETCH", uid, "(BODY.PEEK[])")
             m.logout()
 
             if typ != "OK" or not data or data[0] is None:
@@ -1749,6 +1859,35 @@ def _cli_read(args):
     print("─" * 70)
 
 
+def _cli_search(args):
+    folders = args.folders.split(",") if args.folders else ["INBOX", "INBOX.Processed"]
+    query = {}
+    if args.from_addr:
+        query["from_addr"] = args.from_addr
+    if args.subject:
+        query["subject"] = args.subject
+    if args.text:
+        query["text"] = args.text
+    if args.since:
+        query["since"] = args.since
+    if args.unseen:
+        query["unseen"] = True
+
+    msgs = search_messages(query, folders=folders, limit=args.limit)
+    if not msgs:
+        print("(no messages found)")
+        return
+    print(f"{'UID':<6} {'FOLDER':<20} {'UNREAD':<7} {'FROM':<30} {'SUBJECT':<45} {'DATE'}")
+    print("-" * 130)
+    for m in msgs:
+        unread = "●" if m["unread"] else " "
+        frm    = (m["from_name"] or m["from_addr"])[:28]
+        subj   = m["subject"][:43]
+        date   = m["date"][:20] if m["date"] else ""
+        folder = m["folder"][:18]
+        print(f"{m['uid']:<6} {folder:<20} {unread:<7} {frm:<30} {subj:<45} {date}")
+
+
 def _cli_move(args):
     move_message(args.uid, args.dest, src_folder=args.folder)
     print(f"✅ Moved {args.uid} from {args.folder} → {args.dest}")
@@ -1801,20 +1940,30 @@ def main():
 
     # --- read ---
     p_read = sub.add_parser("read", help="Read a message (body + threading headers)")
-    p_read.add_argument("uid", help="IMAP sequence number")
+    p_read.add_argument("uid", help="IMAP UID (from waggle list or waggle search)")
     p_read.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_read.add_argument("--mark-read", action="store_true", default=False,
                         help="Mark message as read (\\Seen) on the server")
 
     # --- move ---
     p_move = sub.add_parser("move", help="Move a message to another folder")
-    p_move.add_argument("uid",  help="IMAP sequence number")
+    p_move.add_argument("uid",  help="IMAP UID (from waggle list or waggle search)")
     p_move.add_argument("dest", help="Destination folder (e.g. INBOX.Processed)")
     p_move.add_argument("--folder", default="INBOX", help="Source folder (default: INBOX)")
 
+    # --- search ---
+    p_srch = sub.add_parser("search", help="Search messages across folders (returns folder+UID together)")
+    p_srch.add_argument("--from",    dest="from_addr", default=None, help="Filter by sender address or name")
+    p_srch.add_argument("--subject", default=None, help="Filter by subject keyword")
+    p_srch.add_argument("--text",    default=None, help="Full-text body search")
+    p_srch.add_argument("--since",   default=None, help="Only messages since date (e.g. 17-Apr-2026)")
+    p_srch.add_argument("--unseen",  action="store_true", default=False, help="Only unread messages")
+    p_srch.add_argument("--folders", default=None, help="Comma-separated folder list (default: INBOX,INBOX.Processed)")
+    p_srch.add_argument("--limit",   type=int, default=20, help="Max results per folder (default: 20)")
+
     # --- attach ---
     p_att = sub.add_parser("attach", help="Download attachments from a message")
-    p_att.add_argument("uid", help="IMAP sequence number")
+    p_att.add_argument("uid", help="IMAP UID (from waggle list or waggle search)")
     p_att.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_att.add_argument("--dest",   default="./attachments", help="Destination directory")
 
@@ -1842,6 +1991,7 @@ def main():
         "move":   _cli_move,
         "attach": _cli_attach,
         "send":   _cli_send,
+        "search": _cli_search,
     }
 
     if args.command in dispatch:
