@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.9"
+__version__ = "1.9.10"
 
 import os
 import re
@@ -323,7 +323,29 @@ def _imap_append_sent(cfg, msg_bytes, folder=None):
                 logger.warning(f"IMAP append to {folder!r} failed: {exc}")
                 return None
 
-        for candidate in _SENT_FOLDER_CANDIDATES:
+        # RFC 6154: try to find Sent folder via \Sent special-use flag first
+        special_sent = None
+        try:
+            typ, folder_list = m.list()
+            if typ == "OK":
+                for item in folder_list:
+                    if item is None:
+                        continue
+                    decoded = item.decode() if isinstance(item, bytes) else item
+                    if r"\Sent" in decoded or "\\Sent" in decoded:
+                        # Parse folder name — last token after separator
+                        parts = decoded.rsplit('"', 1)
+                        if len(parts) == 2:
+                            special_sent = parts[-1].strip().strip('"')
+                        else:
+                            # unquoted name
+                            special_sent = decoded.rsplit(None, 1)[-1].strip()
+                        break
+        except Exception as exc:
+            logger.debug(f"Special-use flag detection failed: {exc}")
+
+        candidates = ([special_sent] if special_sent else []) + list(_SENT_FOLDER_CANDIDATES)
+        for candidate in candidates:
             try:
                 status, _ = m.select(candidate, readonly=True)
                 if status != "OK":
