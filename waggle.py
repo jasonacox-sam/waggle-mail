@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.11"
+__version__ = "1.9.12"
 
 import os
 import re
@@ -1515,7 +1515,7 @@ def _md_to_html_simple(text):
 
     def _list_block(m):
         lines = m.group(0).rstrip('\n').split('\n')
-        return _render_list(lines)
+        return '\n\n' + _render_list(lines) + '\n\n'
     html = re.sub(r'(^[ \t]*(?:\d+\.|[-*]) .+\n?)+', _list_block, html, flags=re.MULTILINE)
 
     _p_style = (
