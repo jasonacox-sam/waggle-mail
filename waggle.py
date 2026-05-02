@@ -1539,7 +1539,9 @@ def _md_to_html_simple(text):
             p = p.replace("\n", "<br>\n")
             wrapped.append(f'<p style="{_p_style}">{p}</p>')
 
-    return "\n".join(wrapped)
+    html_out = "\n".join(wrapped)
+    html_out = __import__('html').unescape(html_out)
+    return html_out
 
 
 def _wrap_html_simple(body_html):
@@ -1556,16 +1558,17 @@ def _md_to_html_rich(text):
     extensions = ["extra", "codehilite", "tables", "fenced_code"]
     ext_configs = {"codehilite": {"noclasses": True, "guess_lang": False}}
     try:
-        html = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
+        html_out = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
     except Exception as e:
         logger.warning(f"Rich markdown rendering failed: {e}, falling back to simple")
-        html = md_lib.markdown(text)
-    html = re.sub(
+        html_out = md_lib.markdown(text)
+    html_out = re.sub(
         r'(<div class="codehilite")\s+(style="([^"]*)")',
         lambda m: f'{m.group(1)} style="{m.group(3).rstrip(";")};padding:10px 14px;border-radius:4px;"',
-        html,
+        html_out,
     )
-    return html
+    html_out = __import__('html').unescape(html_out)
+    return html_out
 
 
 _DEFAULT_FONT_FAMILY = "Aptos, Calibri, Arial, sans-serif"
