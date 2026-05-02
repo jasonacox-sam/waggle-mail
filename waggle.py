@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.12"
+__version__ = "1.9.13"
 
 import html
 import os
@@ -106,6 +106,7 @@ import logging
 import mimetypes
 import tempfile
 import secrets
+import html
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText

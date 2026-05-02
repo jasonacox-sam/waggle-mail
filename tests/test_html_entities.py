@@ -50,7 +50,7 @@ class TestHtmlEntityDecoding:
 
     def test_named_entities_decoded(self):
         """Named entities like &amp; &lt; &gt; are decoded."""
-        raw = self._make_raw_message("A \u0026 B &lt; C &gt; D", "text/plain")
+        raw = self._make_raw_message("A &amp; B &lt; C &gt; D", "text/plain")
         result = waggle._parse_message(raw)
         assert "&" in result["body_plain"]
         assert "<" in result["body_plain"]
@@ -63,3 +63,43 @@ class TestHtmlEntityDecoding:
         raw = self._make_raw_message("Just plain text.", "text/plain")
         result = waggle._parse_message(raw)
         assert result["body_plain"] == "Just plain text.\n"
+
+
+class TestHtmlEntityDecodingQuotedBody:
+    """Tests that html.unescape() works in fetch_quoted_body()."""
+
+    def _make_raw_message(self, body_text, content_type="text/plain"):
+        """Build a minimal raw RFC-822 bytes payload."""
+        from email.mime.text import MIMEText
+        msg = email.message.EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg["Subject"] = "Test"
+        msg["Message-Id"] = "<quoted123@example.com>"
+        msg.set_content(body_text, subtype="plain" if content_type == "text/plain" else "html")
+        return msg.as_bytes()
+
+    def test_quoted_plain_decodes_numeric_entities(self):
+        """fetch_quoted_body plain text decodes &#8217; → right single quote."""
+        raw = self._make_raw_message("It&#8217;s working", "text/plain")
+        # Mock _parse_message-like extraction manually
+        import email
+        msg = email.message_from_bytes(raw)
+        p = msg.get_payload(decode=True)
+        decoded = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        import html
+        result = html.unescape(decoded)
+        assert "’" in result          # right single quote
+        assert "&#8217;" not in result
+
+    def test_quoted_plain_decodes_named_entities(self):
+        """fetch_quoted_body plain text decodes &amp; → &."""
+        raw = self._make_raw_message("A &amp; B", "text/plain")
+        import email
+        msg = email.message_from_bytes(raw)
+        p = msg.get_payload(decode=True)
+        decoded = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        import html
+        result = html.unescape(decoded)
+        assert "&" in result
+        assert "&amp;" not in result
