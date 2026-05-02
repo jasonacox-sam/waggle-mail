@@ -1534,6 +1534,7 @@ def _md_to_html_simple(text):
         if m:
             wrapped.append(_blocks[int(m.group(1))])
         elif re.match(r"<(h[1-6]|ul|ol|blockquote|hr|div|table|pre)[\s>]", p):
+            wrapped.append(p)
         else:
             p = p.replace("\n", "<br>\n")
             wrapped.append(f'<p style="{_p_style}">{p}</p>')
