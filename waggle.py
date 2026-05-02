@@ -91,8 +91,9 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.12"
+__version__ = "1.9.13"
 
+import html
 import os
 import re
 import ssl
@@ -105,6 +106,7 @@ import logging
 import mimetypes
 import tempfile
 import secrets
+import html
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -468,15 +470,15 @@ def _parse_message(raw_bytes):
             elif ct == "text/plain" and body_plain is None:
                 p = part.get_payload(decode=True)
                 if p:
-                    body_plain = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    body_plain = html.unescape(p.decode(part.get_content_charset() or "utf-8", errors="replace"))
             elif ct == "text/html" and body_html is None:
                 p = part.get_payload(decode=True)
                 if p:
-                    body_html = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    body_html = html.unescape(p.decode(part.get_content_charset() or "utf-8", errors="replace"))
     else:
         p = msg.get_payload(decode=True)
         if p:
-            body_plain = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            body_plain = html.unescape(p.decode(msg.get_content_charset() or "utf-8", errors="replace"))
 
     # Build reply references chain
     if references and message_id:
@@ -1262,15 +1264,15 @@ def fetch_quoted_body(message_id, config=None):
             if ct == "text/plain" and plain_body is None:
                 p = part.get_payload(decode=True)
                 if p:
-                    plain_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    plain_body = html.unescape(p.decode(part.get_content_charset() or "utf-8", errors="replace"))
             elif ct == "text/html" and html_body is None:
                 p = part.get_payload(decode=True)
                 if p:
-                    html_body = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    html_body = html.unescape(p.decode(part.get_content_charset() or "utf-8", errors="replace"))
     else:
         p = msg.get_payload(decode=True)
         if p:
-            plain_body = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            plain_body = html.unescape(p.decode(msg.get_content_charset() or "utf-8", errors="replace"))
 
     # --- Plain text quoted block (Outlook style, full body, no trimming) ---
     attr_lines = [
@@ -1537,7 +1539,9 @@ def _md_to_html_simple(text):
             p = p.replace("\n", "<br>\n")
             wrapped.append(f'<p style="{_p_style}">{p}</p>')
 
-    return "\n".join(wrapped)
+    html_out = "\n".join(wrapped)
+    html_out = __import__('html').unescape(html_out)
+    return html_out
 
 
 def _wrap_html_simple(body_html):
@@ -1554,16 +1558,17 @@ def _md_to_html_rich(text):
     extensions = ["extra", "codehilite", "tables", "fenced_code"]
     ext_configs = {"codehilite": {"noclasses": True, "guess_lang": False}}
     try:
-        html = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
+        html_out = md_lib.markdown(text, extensions=extensions, extension_configs=ext_configs)
     except Exception as e:
         logger.warning(f"Rich markdown rendering failed: {e}, falling back to simple")
-        html = md_lib.markdown(text)
-    html = re.sub(
+        html_out = md_lib.markdown(text)
+    html_out = re.sub(
         r'(<div class="codehilite")\s+(style="([^"]*)")',
         lambda m: f'{m.group(1)} style="{m.group(3).rstrip(";")};padding:10px 14px;border-radius:4px;"',
-        html,
+        html_out,
     )
-    return html
+    html_out = __import__('html').unescape(html_out)
+    return html_out
 
 
 _DEFAULT_FONT_FAMILY = "Aptos, Calibri, Arial, sans-serif"
