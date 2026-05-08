@@ -407,8 +407,8 @@ def test_retry_loop_eventually_acquires(tmp_db):
     assert call_count[0] >= 3
 
 
-def test_lock_exhausted_returns_none(tmp_db, monkeypatch, caplog):
-    """When lock cannot be acquired, returns None and logs warning."""
+def test_lock_exhausted_raises_runtime_error(tmp_db, monkeypatch, caplog):
+    """When lock cannot be acquired after all retries, raises RuntimeError (fail-closed)."""
     import waggle, fcntl as fcntl_mod, logging
 
     def always_locked(fd, op):
@@ -418,7 +418,26 @@ def test_lock_exhausted_returns_none(tmp_db, monkeypatch, caplog):
     monkeypatch.setattr(fcntl_mod, 'flock', always_locked)
 
     with caplog.at_level(logging.WARNING, logger='waggle.reply_guard'):
-        lock_fh = waggle._acquire_reply_lock(retries=3, retry_ms=1)
+        with pytest.raises(RuntimeError, match='Unable to acquire reply guard lock'):
+            waggle._acquire_reply_lock(retries=3, retry_ms=1)
 
-    assert lock_fh is None
-    assert any('still locked' in r.message for r in caplog.records)
+    assert any('Unable to acquire' in r.message for r in caplog.records)
+
+
+def test_reply_all_fails_when_lock_exhausted(tmp_db, monkeypatch):
+    """reply_all() raises RuntimeError when lock can't be acquired — fail-closed, not fail-open."""
+    import waggle, fcntl as fcntl_mod
+
+    def always_locked(fd, op):
+        if op & fcntl_mod.LOCK_NB:
+            raise BlockingIOError('always locked')
+
+    monkeypatch.setattr(fcntl_mod, 'flock', always_locked)
+    monkeypatch.setattr(waggle, '_build_cfg', lambda c=None: {'from_addr': 'sam@example.com'})
+    monkeypatch.setattr(waggle, 'send_email', lambda **kw: None)
+
+    with pytest.raises(RuntimeError, match='Unable to acquire reply guard lock'):
+        waggle.reply_all(make_msg('<lock-fail@example.com>'), body_md='Should not send')
+
+    # Nothing should have been sent
+    assert not tmp_db.exists() or '<lock-fail@example.com>' not in json.loads(tmp_db.read_text())

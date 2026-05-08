@@ -182,11 +182,15 @@ def _save_reply_db(db):
         _guard_log.warning(f'Could not save waggle-replied.json: {e} — guard state may be lost.')
 
 
-def _acquire_reply_lock(retries=5, retry_ms=100):
+def _acquire_reply_lock(retries=10, retry_ms=200):
     """
-    Non-blocking file lock with retry loop. Max wait = retries * retry_ms ms.
-    Returns open file handle with lock held, or None if exhausted.
-    Caller must release: fcntl.flock(fh, LOCK_UN); fh.close()
+    Non-blocking file lock with retry loop.
+    Default: 10 attempts × 200ms = 2 seconds max wait.
+
+    Returns open file handle with lock held on success.
+    Raises RuntimeError if lock cannot be acquired after all retries —
+    fail-closed so the caller surfaces the error rather than bypassing
+    the guard.
     """
     import time
     _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -204,14 +208,19 @@ def _acquire_reply_lock(retries=5, retry_ms=100):
                 _guard_log.debug(f'Reply DB locked (attempt {attempt}/{retries}), retrying in {retry_ms}ms...')
                 time.sleep(retry_ms / 1000)
             else:
-                _guard_log.warning(
-                    f'Reply DB still locked after {retries} attempts ({retries * retry_ms}ms). '
-                    f'Proceeding without lock — duplicate guard weakened for this call.'
+                total_ms = retries * retry_ms
+                msg = (
+                    f'Unable to acquire reply guard lock after {retries} attempts ({total_ms}ms). '
+                    f'Another process may be sending. Try again shortly.'
                 )
+                _guard_log.warning(msg)
+                raise RuntimeError(msg)
         except Exception as e:
-            _guard_log.warning(f'Could not acquire reply lock: {e}')
-            return None
-    return None
+            msg = f'Could not acquire reply guard lock: {e}'
+            _guard_log.warning(msg)
+            raise RuntimeError(msg)
+    # Should never reach here
+    raise RuntimeError('Unable to acquire reply guard lock.')
 
 
 def _release_lock(lock_fh):
@@ -317,13 +326,9 @@ def _begin_send_guarded(message_id, force=False):
         _release_lock(lock_fh)  # release before SMTP — lock only guards DB writes
         return None, needs_retry_prefix  # lock_fh is None; caller does not hold it
 
-    except RuntimeError:
+    except Exception:
         _release_lock(lock_fh)
-        raise
-    except Exception as e:
-        _release_lock(lock_fh)
-        _guard_log.warning(f'_begin_send_guarded error for {mid}: {e} — proceeding unguarded.')
-        return None, False
+        raise  # RuntimeError from guard logic or lock acquisition — let it propagate
 
 
 def _confirm_send_guarded(message_id):
