@@ -107,7 +107,61 @@ import mimetypes
 import tempfile
 import secrets
 import html
+import json
+import datetime
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Duplicate reply guard
+# ---------------------------------------------------------------------------
+
+_REPLY_DB_PATH = Path.home() / '.openclaw' / 'waggle-replied.json'
+_REPLY_DB_MAX_DAYS = 30  # prune entries older than this
+
+
+def _load_reply_db():
+    """Load the replied Message-ID database."""
+    try:
+        if _REPLY_DB_PATH.exists():
+            return json.loads(_REPLY_DB_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_reply_db(db):
+    """Save the replied Message-ID database, pruning old entries."""
+    try:
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=_REPLY_DB_MAX_DAYS)).isoformat()
+        pruned = {mid: ts for mid, ts in db.items() if ts >= cutoff}
+        _REPLY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _REPLY_DB_PATH.write_text(json.dumps(pruned, indent=2))
+    except Exception:
+        pass
+
+
+def check_already_replied(message_id):
+    """
+    Check if waggle has already sent a reply to the given Message-ID.
+
+    Returns (bool, timestamp_str_or_None)
+    """
+    if not message_id:
+        return False, None
+    db = _load_reply_db()
+    mid = message_id.strip()
+    if mid in db:
+        return True, db[mid]
+    return False, None
+
+
+def _mark_replied(message_id):
+    """Record that we replied to this Message-ID."""
+    if not message_id:
+        return
+    db = _load_reply_db()
+    db[message_id.strip()] = datetime.datetime.now().isoformat()
+    _save_reply_db(db)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -1758,7 +1812,7 @@ def send_email(
     _log_sent(to, subject)
 
 
-def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
     """
     Reply-all to a message returned by read_message().
 
@@ -1779,11 +1833,21 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         attachments: Optional list of file paths to attach.
         rich:        Enable rich HTML rendering (opt-in).
         config:      Optional config dict.
+        force:       Set True to send even if already replied (override guard).
 
     Example:
         msg = read_message("42")
         reply_all(msg, body_md="Thanks for the note — here's my response.")
     """
+    # --- Duplicate reply guard ---
+    message_id = msg.get("message_id", "")
+    already, when = check_already_replied(message_id)
+    if already and not force:
+        raise RuntimeError(
+            f"Already replied to message {message_id} at {when}. "
+            f"Pass force=True to reply_all() if you intentionally want to send again."
+        )
+
     cfg = _build_cfg(config)
     own_addr = cfg["from_addr"].strip().lower()
 
@@ -1813,9 +1877,11 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         rich=rich,
         config=config,
     )
+    # Log the reply so future calls are blocked
+    _mark_replied(message_id)
 
 
-def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
     """
     Reply directly to the sender of a message — no CC.
 
@@ -1835,6 +1901,15 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         msg = read_message("42")
         reply(msg, body_md="Just between us — here's my answer.")
     """
+    # --- Duplicate reply guard ---
+    message_id = msg.get("message_id", "")
+    already, when = check_already_replied(message_id)
+    if already and not force:
+        raise RuntimeError(
+            f"Already replied to message {message_id} at {when}. "
+            f"Pass force=True to reply() if you intentionally want to send again."
+        )
+
     send_email(
         to=msg["from_addr"],
         subject=msg["reply_subject"],
@@ -1846,6 +1921,8 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         rich=rich,
         config=config,
     )
+    # Log the reply so future calls are blocked
+    _mark_replied(message_id)
 
 
 # ---------------------------------------------------------------------------
