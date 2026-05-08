@@ -294,6 +294,61 @@ def test_toctou_only_one_reply_sent(tmp_db, monkeypatch):
     assert 'Already replied' in errors[0] or 'in progress' in errors[0]
 
 
+def test_toctou_slow_smtp_lock_not_held(tmp_db, monkeypatch):
+    """
+    Critical: lock must NOT be held during SMTP send.
+    Two threads: A starts slow SMTP, B checks DB and should see 'pending' and block.
+    B should NOT be able to slip through because the lock expired.
+    """
+    import waggle, time
+
+    sent = []
+    errors = []
+    b_started = threading.Event()
+    a_sending = threading.Event()
+
+    def slow_send(**kw):
+        a_sending.set()      # signal that A is now mid-SMTP
+        b_started.wait()     # wait for B to have started
+        time.sleep(0.2)      # simulate slow SMTP (well beyond 500ms retry budget if lock were held)
+        sent.append(kw)
+
+    def instant_send(**kw):
+        sent.append(kw)
+
+    monkeypatch.setattr(waggle, '_build_cfg', lambda c=None: {'from_addr': 'sam@example.com'})
+
+    mid = '<slow-smtp@example.com>'
+    msg = make_msg(mid)
+
+    def thread_a():
+        monkeypatch.setattr(waggle, 'send_email', slow_send)
+        try:
+            waggle.reply_all(msg, body_md='A sending')
+        except RuntimeError as e:
+            errors.append(f'A: {e}')
+
+    def thread_b():
+        a_sending.wait()     # wait until A is mid-SMTP
+        b_started.set()      # signal A we started
+        monkeypatch.setattr(waggle, 'send_email', instant_send)
+        try:
+            waggle.reply_all(msg, body_md='B duplicate attempt')
+        except RuntimeError as e:
+            errors.append(f'B: {e}')
+
+    t1 = threading.Thread(target=thread_a)
+    t2 = threading.Thread(target=thread_b)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # B should have been blocked by pending state, not by lock timeout
+    assert len(sent) == 1, f'Expected 1 send, got {len(sent)} — duplicate leaked through'
+    assert any('B:' in e for e in errors), f'B should have been blocked, errors: {errors}'
+
+
 # ---------------------------------------------------------------------------
 # Lock retry loop
 # ---------------------------------------------------------------------------

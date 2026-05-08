@@ -277,7 +277,7 @@ def _begin_send_guarded(message_id, force=False):
     Atomic guard: acquire lock, expire pending entries, check state, write 'pending'.
 
     Returns (lock_fh, needs_retry_prefix):
-      lock_fh            — held lock (release after send + _confirm_send_guarded)
+      lock_fh            — always None (lock released before SMTP send)
       needs_retry_prefix — True if body should include the retry disclaimer
 
     Raises RuntimeError if message was already sent and force=False.
@@ -309,10 +309,13 @@ def _begin_send_guarded(message_id, force=False):
 
         needs_retry_prefix = (state == 'retry')
 
-        # Mark as pending — locked under file lock so concurrent callers see it
+        # Mark as pending and RELEASE THE LOCK before returning.
+        # The SMTP send happens outside the lock — pending state in the DB
+        # is what blocks concurrent callers, not the file lock.
         db[mid] = f'pending:{datetime.datetime.now().isoformat()}'
         _save_reply_db(db)
-        return lock_fh, needs_retry_prefix
+        _release_lock(lock_fh)  # release before SMTP — lock only guards DB writes
+        return None, needs_retry_prefix  # lock_fh is None; caller does not hold it
 
     except RuntimeError:
         _release_lock(lock_fh)
@@ -323,14 +326,16 @@ def _begin_send_guarded(message_id, force=False):
         return None, False
 
 
-def _confirm_send_guarded(message_id, lock_fh):
+def _confirm_send_guarded(message_id):
     """
-    Called after a successful send. Writes 'sent:<ts>' and releases the lock.
+    Called after a successful send. Acquires lock, writes 'sent:<ts>', releases lock.
+    The lock is re-acquired here (not held from _begin_send_guarded) so SMTP runs
+    completely outside the lock window.
     """
     if not message_id:
-        _release_lock(lock_fh)
         return
     mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
     try:
         db = _load_reply_db()
         db[mid] = f'sent:{datetime.datetime.now().isoformat()}'
@@ -341,14 +346,15 @@ def _confirm_send_guarded(message_id, lock_fh):
         _release_lock(lock_fh)
 
 
-def _abort_send_guarded(message_id, lock_fh):
+def _abort_send_guarded(message_id):
     """
-    Called after a failed send. Clears the pending state so retries are allowed.
+    Called after a failed send. Acquires lock, clears pending state, releases lock.
+    Clears pending so the next call to reply_all/reply can retry cleanly.
     """
     if not message_id:
-        _release_lock(lock_fh)
         return
     mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
     try:
         db = _load_reply_db()
         if db.get(mid, '').startswith('pending:'):
@@ -2075,9 +2081,9 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
             config=config,
         )
     except Exception:
-        _abort_send_guarded(message_id, lock_fh)  # clear pending, allow retry
+        _abort_send_guarded(message_id)  # clear pending, allow retry
         raise
-    _confirm_send_guarded(message_id, lock_fh)  # write sent:<ts>, release lock
+    _confirm_send_guarded(message_id)  # write sent:<ts>
 
 
 def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
