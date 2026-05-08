@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.13"
+__version__ = "1.9.17"
 
 import html
 import os
@@ -107,7 +107,270 @@ import mimetypes
 import tempfile
 import secrets
 import html
+import json
+import fcntl
+import datetime
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Duplicate reply guard
+# ---------------------------------------------------------------------------
+
+_REPLY_DB_PATH = Path.home() / '.openclaw' / 'waggle-replied.json'
+_REPLY_DB_LOCK_PATH = Path.home() / '.openclaw' / 'waggle-replied.lock'
+_REPLY_DB_MAX_DAYS = 30       # prune entries older than this
+_REPLY_PENDING_TIMEOUT = 3600  # seconds before pending → retry (1 hour)
+_guard_log = logging.getLogger('waggle.reply_guard')
+
+# Prefix injected into retry sends so recipients know it may be a duplicate
+_RETRY_PREFIX = (
+    "> ⚠️ **Note:** A previous attempt to send this message encountered an error.\n"
+    "> This may be a duplicate — apologies if so.\n\n---\n\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Reply state machine
+#
+# States stored in waggle-replied.json keyed by Message-ID:
+#
+#   (absent)           — never attempted, safe to send
+#   "pending:<ts>"     — lock acquired, send in progress
+#   "sent:<ts>"        — successfully sent, permanently blocked
+#   "retry"            — pending expired (>1h), previous outcome unknown;
+#                        next send attempt will prepend _RETRY_PREFIX
+#
+# Transitions:
+#   absent   → pending  : _set_reply_state(mid, 'pending')  [under lock]
+#   pending  → sent     : _set_reply_state(mid, 'sent')     [after successful send]
+#   pending  → absent   : _clear_reply_state(mid)           [after failed send]
+#   pending  → retry    : _expire_pending_to_retry()        [hourly purge / on next read]
+#   retry    → sent     : _set_reply_state(mid, 'sent')     [after successful retry send]
+# ---------------------------------------------------------------------------
+
+
+def _load_reply_db():
+    """Load the replied Message-ID database, logging warnings on failure."""
+    try:
+        if _REPLY_DB_PATH.exists():
+            return json.loads(_REPLY_DB_PATH.read_text())
+    except json.JSONDecodeError as e:
+        _guard_log.warning(f'waggle-replied.json is corrupted ({e}) — treating as empty.')
+    except Exception as e:
+        _guard_log.warning(f'Could not load waggle-replied.json: {e} — guard disabled for this call.')
+    return {}
+
+
+def _save_reply_db(db):
+    """Atomic write + 30-day pruning."""
+    try:
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=_REPLY_DB_MAX_DAYS)).isoformat()
+        pruned = {}
+        for mid, state in db.items():
+            # Keep sent entries within 30 days; keep pending/retry always (they're transient)
+            if state.startswith('sent:'):
+                ts = state[5:]
+                if ts >= cutoff:
+                    pruned[mid] = state
+            else:
+                pruned[mid] = state  # pending/retry always kept (purge handles them)
+        _REPLY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _REPLY_DB_PATH.parent / (_REPLY_DB_PATH.name + '.tmp')
+        tmp.write_text(json.dumps(pruned, indent=2))
+        tmp.replace(_REPLY_DB_PATH)
+    except Exception as e:
+        _guard_log.warning(f'Could not save waggle-replied.json: {e} — guard state may be lost.')
+
+
+def _acquire_reply_lock(retries=10, retry_ms=200):
+    """
+    Non-blocking file lock with retry loop.
+    Default: 10 attempts × 200ms = 2 seconds max wait.
+
+    Returns open file handle with lock held on success.
+    Raises RuntimeError if lock cannot be acquired after all retries —
+    fail-closed so the caller surfaces the error rather than bypassing
+    the guard.
+    """
+    import time
+    _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, retries + 1):
+        try:
+            fh = open(_REPLY_DB_LOCK_PATH, 'w')
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except BlockingIOError:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            if attempt < retries:
+                _guard_log.debug(f'Reply DB locked (attempt {attempt}/{retries}), retrying in {retry_ms}ms...')
+                time.sleep(retry_ms / 1000)
+            else:
+                total_ms = retries * retry_ms
+                msg = (
+                    f'Unable to acquire reply guard lock after {retries} attempts ({total_ms}ms). '
+                    f'Another process may be sending. Try again shortly.'
+                )
+                _guard_log.warning(msg)
+                raise RuntimeError(msg)
+        except Exception as e:
+            msg = f'Could not acquire reply guard lock: {e}'
+            _guard_log.warning(msg)
+            raise RuntimeError(msg)
+    # Should never reach here
+    raise RuntimeError('Unable to acquire reply guard lock.')
+
+
+def _release_lock(lock_fh):
+    """Release a lock file handle safely."""
+    if lock_fh:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _expire_pending(db):
+    """
+    Convert stale pending entries (> _REPLY_PENDING_TIMEOUT seconds old) to 'retry'.
+    Mutates db in place. Call while holding the lock.
+    """
+    now = datetime.datetime.now()
+    for mid, state in list(db.items()):
+        if state.startswith('pending:'):
+            try:
+                ts = datetime.datetime.fromisoformat(state[8:])
+                age = (now - ts).total_seconds()
+                if age > _REPLY_PENDING_TIMEOUT:
+                    _guard_log.warning(
+                        f'Reply to {mid} has been pending for {int(age)}s — '
+                        f'marking as retry (previous send outcome unknown).'
+                    )
+                    db[mid] = 'retry'
+            except Exception:
+                db[mid] = 'retry'  # malformed timestamp → treat as expired
+
+
+def check_already_replied(message_id):
+    """
+    Check if waggle has already sent a reply to the given Message-ID.
+
+    Returns (bool, state_str_or_None) where state is one of:
+      'sent:<ts>'  — definitively sent
+      'pending:<ts>' — send in progress
+      'retry'      — previous attempt outcome unknown, will retry with disclaimer
+      None         — never attempted
+
+    Note: empty/None message_id bypasses the guard (returns False, None).
+    This is a lock-free read for external pre-flight checks. The authoritative
+    check happens inside the lock in _begin_send_guarded().
+    """
+    if not message_id:
+        _guard_log.debug('check_already_replied: empty message_id — bypassing guard')
+        return False, None
+    db = _load_reply_db()
+    mid = message_id.strip()
+    state = db.get(mid)
+    if state is None:
+        return False, None
+    if state == 'retry':
+        return False, 'retry'  # allowed but will get disclaimer prefix
+    return True, state
+
+
+def _begin_send_guarded(message_id, force=False):
+    """
+    Atomic guard: acquire lock, expire pending entries, check state, write 'pending'.
+
+    Returns (lock_fh, needs_retry_prefix):
+      lock_fh            — always None (lock released before SMTP send)
+      needs_retry_prefix — True if body should include the retry disclaimer
+
+    Raises RuntimeError if message was already sent and force=False.
+    Returns (None, False) if lock could not be acquired (fail-open with warning).
+    """
+    if not message_id:
+        return None, False
+
+    mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
+
+    try:
+        db = _load_reply_db()
+        _expire_pending(db)  # pending → retry if >1h old
+
+        state = db.get(mid)
+
+        if state is not None and state.startswith('sent:') and not force:
+            raise RuntimeError(
+                f"Already replied to message {message_id} (sent at {state[5:]}). "
+                f"Pass force=True to reply_all() if you intentionally want to send again."
+            )
+
+        if state is not None and state.startswith('pending:') and not force:
+            raise RuntimeError(
+                f"Reply to message {message_id} is already in progress (since {state[8:]}). "
+                f"If this is stuck, wait 1 hour for automatic retry promotion, or pass force=True."
+            )
+
+        needs_retry_prefix = (state == 'retry')
+
+        # Mark as pending and RELEASE THE LOCK before returning.
+        # The SMTP send happens outside the lock — pending state in the DB
+        # is what blocks concurrent callers, not the file lock.
+        db[mid] = f'pending:{datetime.datetime.now().isoformat()}'
+        _save_reply_db(db)
+        _release_lock(lock_fh)  # release before SMTP — lock only guards DB writes
+        return None, needs_retry_prefix  # lock_fh is None; caller does not hold it
+
+    except Exception:
+        _release_lock(lock_fh)
+        raise  # RuntimeError from guard logic or lock acquisition — let it propagate
+
+
+def _confirm_send_guarded(message_id):
+    """
+    Called after a successful send. Acquires lock, writes 'sent:<ts>', releases lock.
+    The lock is re-acquired here (not held from _begin_send_guarded) so SMTP runs
+    completely outside the lock window.
+    """
+    if not message_id:
+        return
+    mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
+    try:
+        db = _load_reply_db()
+        db[mid] = f'sent:{datetime.datetime.now().isoformat()}'
+        _save_reply_db(db)
+    except Exception as e:
+        _guard_log.warning(f'_confirm_send_guarded failed for {mid}: {e} — guard state may be lost.')
+    finally:
+        _release_lock(lock_fh)
+
+
+def _abort_send_guarded(message_id):
+    """
+    Called after a failed send. Acquires lock, clears pending state, releases lock.
+    Clears pending so the next call to reply_all/reply can retry cleanly.
+    """
+    if not message_id:
+        return
+    mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
+    try:
+        db = _load_reply_db()
+        if db.get(mid, '').startswith('pending:'):
+            del db[mid]
+            _save_reply_db(db)
+    except Exception as e:
+        _guard_log.warning(f'_abort_send_guarded failed for {mid}: {e}')
+    finally:
+        _release_lock(lock_fh)
+
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -1758,7 +2021,7 @@ def send_email(
     _log_sent(to, subject)
 
 
-def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
     """
     Reply-all to a message returned by read_message().
 
@@ -1779,11 +2042,19 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         attachments: Optional list of file paths to attach.
         rich:        Enable rich HTML rendering (opt-in).
         config:      Optional config dict.
+        force:       Set True to send even if already replied (override guard).
 
     Example:
         msg = read_message("42")
         reply_all(msg, body_md="Thanks for the note — here's my response.")
     """
+    # --- Duplicate reply guard: three-state atomic machine ---
+    # pending → lock held across send; sent → permanently blocked; retry → sends with disclaimer
+    message_id = msg.get("message_id", "")
+    lock_fh, needs_retry_prefix = _begin_send_guarded(message_id, force=force)
+    if needs_retry_prefix:
+        body_md = _RETRY_PREFIX + body_md
+
     cfg = _build_cfg(config)
     own_addr = cfg["from_addr"].strip().lower()
 
@@ -1801,21 +2072,26 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
     # Normalize whitespace in references (long chains may have folded CRLF)
     refs = re.sub(r'[\r\n]+\s*', ' ', msg.get("reply_references", "") or "").strip()
 
-    send_email(
-        to=msg["from_addr"],
-        subject=msg["reply_subject"],
-        body_md=body_md,
-        cc=reply_cc or None,
-        in_reply_to=msg["message_id"],
-        references=refs or None,
-        from_name=from_name,
-        attachments=attachments,
-        rich=rich,
-        config=config,
-    )
+    try:
+        send_email(
+            to=msg["from_addr"],
+            subject=msg["reply_subject"],
+            body_md=body_md,
+            cc=reply_cc or None,
+            in_reply_to=msg["message_id"],
+            references=refs or None,
+            from_name=from_name,
+            attachments=attachments,
+            rich=rich,
+            config=config,
+        )
+    except Exception:
+        _abort_send_guarded(message_id)  # clear pending, allow retry
+        raise
+    _confirm_send_guarded(message_id)  # write sent:<ts>
 
 
-def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None):
+def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
     """
     Reply directly to the sender of a message — no CC.
 
@@ -1835,17 +2111,28 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         msg = read_message("42")
         reply(msg, body_md="Just between us — here's my answer.")
     """
-    send_email(
-        to=msg["from_addr"],
-        subject=msg["reply_subject"],
-        body_md=body_md,
-        in_reply_to=msg["message_id"],
-        references=msg["reply_references"],
-        from_name=from_name,
-        attachments=attachments,
-        rich=rich,
-        config=config,
-    )
+    # --- Duplicate reply guard: three-state atomic machine ---
+    message_id = msg.get("message_id", "")
+    lock_fh, needs_retry_prefix = _begin_send_guarded(message_id, force=force)
+    if needs_retry_prefix:
+        body_md = _RETRY_PREFIX + body_md
+
+    try:
+        send_email(
+            to=msg["from_addr"],
+            subject=msg["reply_subject"],
+            body_md=body_md,
+            in_reply_to=msg["message_id"],
+            references=msg["reply_references"],
+            from_name=from_name,
+            attachments=attachments,
+            rich=rich,
+            config=config,
+        )
+    except Exception:
+        _abort_send_guarded(message_id)
+        raise
+    _confirm_send_guarded(message_id)
 
 
 # ---------------------------------------------------------------------------
