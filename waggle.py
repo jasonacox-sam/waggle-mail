@@ -147,7 +147,7 @@ def _save_reply_db(db):
         pruned = {mid: ts for mid, ts in db.items() if ts >= cutoff}
         _REPLY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: write to temp file then rename so no partial writes
-        tmp = _REPLY_DB_PATH.with_suffix('.tmp')
+        tmp = _REPLY_DB_PATH.parent / (_REPLY_DB_PATH.name + '.tmp')
         tmp.write_text(json.dumps(pruned, indent=2))
         tmp.replace(_REPLY_DB_PATH)
     except Exception as e:
@@ -162,6 +162,10 @@ def check_already_replied(message_id):
     returns (False, None). Emails without Message-IDs are rare but real;
     the right default is to allow sending rather than block on unknowns.
 
+    This is a lock-free read for external callers (e.g. pre-flight checks).
+    Inside reply_all()/reply(), the authoritative check happens *inside* the
+    file lock to prevent TOCTOU races between concurrent processes.
+
     Returns (bool, timestamp_str_or_None)
     """
     if not message_id:
@@ -174,52 +178,118 @@ def check_already_replied(message_id):
     return False, None
 
 
-def _mark_replied(message_id, _retries=5, _retry_ms=100):
+def _acquire_reply_lock(retries=5, retry_ms=100):
     """
-    Record that we replied to this Message-ID.
+    Acquire the reply DB file lock with a retry loop.
 
-    Uses a non-blocking file lock with retry loop to handle the common case
-    where two processes (e.g. heartbeat + manual inbox check) try to reply
-    to the same email simultaneously.
+    Returns an open file handle with the lock held, or None if all retries
+    are exhausted. Caller must release with fcntl.flock(fh, LOCK_UN) and
+    close the handle.
 
-    Retry policy: up to _retries attempts, sleeping _retry_ms ms between
-    each. If the lock is still held after all retries, logs a warning and
-    proceeds without writing (fail-open: prefer a rare duplicate over an
-    indefinite block).
+    Using LOCK_NB (non-blocking) + retry loop so we never block indefinitely.
+    Max wait = retries * retry_ms ms (default: 500ms).
+    """
+    import time
+    _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, retries + 1):
+        try:
+            fh = open(_REPLY_DB_LOCK_PATH, 'w')
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh  # caller holds the lock
+        except BlockingIOError:
+            fh.close()
+            if attempt < retries:
+                _guard_log.debug(
+                    f'Reply DB locked (attempt {attempt}/{retries}), '
+                    f'retrying in {retry_ms}ms...'
+                )
+                time.sleep(retry_ms / 1000)
+            else:
+                _guard_log.warning(
+                    f'Reply DB still locked after {retries} attempts '
+                    f'({retries * retry_ms}ms total). '
+                    f'Proceeding without lock — duplicate guard weakened.'
+                )
+        except Exception as e:
+            _guard_log.warning(f'Could not acquire reply lock: {e}')
+            return None
+    return None
+
+
+def _check_and_mark_replied(message_id, force=False):
+    """
+    Atomic check-then-mark under file lock.
+
+    This is the heart of the duplicate reply guard. By holding the lock across
+    both the check AND the write, we prevent the TOCTOU race where two
+    concurrent processes both read 'not replied yet' before either has written.
+
+    Flow (inside lock):
+      1. Re-read DB (authoritative — another process may have written since
+         the pre-flight check in reply_all())
+      2. If already replied and not force → raise RuntimeError
+      3. Otherwise send (caller handles this) → write Message-ID to DB
+
+    Returns: None if safe to send (caller should send then call _mark_replied_locked)
+    Raises: RuntimeError if already replied and force=False
+    Raises: passes through any lock acquisition failure gracefully
+    """
+    if not message_id:
+        return  # no Message-ID → bypass guard
+
+    mid = message_id.strip()
+    lock_fh = _acquire_reply_lock()
+
+    try:
+        # Authoritative re-check inside the lock
+        db = _load_reply_db()
+        if mid in db and not force:
+            raise RuntimeError(
+                f"Already replied to message {message_id} at {db[mid]}. "
+                f"Pass force=True to reply_all() if you intentionally want to send again."
+            )
+        return lock_fh  # return held lock so caller can write after send
+    except RuntimeError:
+        # Release lock before re-raising
+        if lock_fh:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        if lock_fh:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+        _guard_log.warning(f'_check_and_mark_replied error: {e}')
+        return None
+
+
+def _mark_replied_locked(message_id, lock_fh):
+    """
+    Write Message-ID to DB and release the lock held by _check_and_mark_replied.
+    Always called after a successful send.
     """
     if not message_id:
         return
-    mid = message_id.strip()
-    import time
     try:
-        _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(1, _retries + 1):
-            with open(_REPLY_DB_LOCK_PATH, 'w') as lock_file:
-                try:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    try:
-                        db = _load_reply_db()
-                        db[mid] = datetime.datetime.now().isoformat()
-                        _save_reply_db(db)
-                    finally:
-                        fcntl.flock(lock_file, fcntl.LOCK_UN)
-                    return  # success
-                except BlockingIOError:
-                    if attempt < _retries:
-                        _guard_log.debug(
-                            f'Reply DB locked (attempt {attempt}/{_retries}), '
-                            f'retrying in {_retry_ms}ms...'
-                        )
-                        time.sleep(_retry_ms / 1000)
-                    else:
-                        _guard_log.warning(
-                            f'Reply DB still locked after {_retries} attempts '
-                            f'({_retries * _retry_ms}ms total). '
-                            f'Proceeding without logging {mid} — '
-                            f'duplicate guard may not fire for this message.'
-                        )
+        mid = message_id.strip()
+        db = _load_reply_db()
+        db[mid] = datetime.datetime.now().isoformat()
+        _save_reply_db(db)
     except Exception as e:
-        _guard_log.warning(f'_mark_replied failed for {mid}: {e} — duplicate guard state may be lost.')
+        _guard_log.warning(f'_mark_replied_locked failed for {message_id}: {e}')
+    finally:
+        if lock_fh:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -1897,14 +1967,11 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         msg = read_message("42")
         reply_all(msg, body_md="Thanks for the note — here's my response.")
     """
-    # --- Duplicate reply guard ---
+    # --- Duplicate reply guard (atomic: check + send + mark under lock) ---
     message_id = msg.get("message_id", "")
-    already, when = check_already_replied(message_id)
-    if already and not force:
-        raise RuntimeError(
-            f"Already replied to message {message_id} at {when}. "
-            f"Pass force=True to reply_all() if you intentionally want to send again."
-        )
+    lock_fh = _check_and_mark_replied(message_id, force=force)
+    # _check_and_mark_replied raises RuntimeError if already replied (and not force)
+    # lock_fh is held until after send — prevents TOCTOU race with concurrent callers
 
     cfg = _build_cfg(config)
     own_addr = cfg["from_addr"].strip().lower()
@@ -1923,20 +1990,31 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
     # Normalize whitespace in references (long chains may have folded CRLF)
     refs = re.sub(r'[\r\n]+\s*', ' ', msg.get("reply_references", "") or "").strip()
 
-    send_email(
-        to=msg["from_addr"],
-        subject=msg["reply_subject"],
-        body_md=body_md,
-        cc=reply_cc or None,
-        in_reply_to=msg["message_id"],
-        references=refs or None,
-        from_name=from_name,
-        attachments=attachments,
-        rich=rich,
-        config=config,
-    )
-    # Log the reply so future calls are blocked
-    _mark_replied(message_id)
+    try:
+        send_email(
+            to=msg["from_addr"],
+            subject=msg["reply_subject"],
+            body_md=body_md,
+            cc=reply_cc or None,
+            in_reply_to=msg["message_id"],
+            references=refs or None,
+            from_name=from_name,
+            attachments=attachments,
+            rich=rich,
+            config=config,
+        )
+    except Exception:
+        # Send failed — release lock without writing so retries are allowed
+        if lock_fh:
+            try:
+                import fcntl as _fcntl
+                _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+        raise
+    # Send succeeded — write Message-ID and release lock
+    _mark_replied_locked(message_id, lock_fh)
 
 
 def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
@@ -1959,28 +2037,32 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         msg = read_message("42")
         reply(msg, body_md="Just between us — here's my answer.")
     """
-    # --- Duplicate reply guard ---
+    # --- Duplicate reply guard (atomic: check + send + mark under lock) ---
     message_id = msg.get("message_id", "")
-    already, when = check_already_replied(message_id)
-    if already and not force:
-        raise RuntimeError(
-            f"Already replied to message {message_id} at {when}. "
-            f"Pass force=True to reply() if you intentionally want to send again."
-        )
+    lock_fh = _check_and_mark_replied(message_id, force=force)
 
-    send_email(
-        to=msg["from_addr"],
-        subject=msg["reply_subject"],
-        body_md=body_md,
-        in_reply_to=msg["message_id"],
-        references=msg["reply_references"],
-        from_name=from_name,
-        attachments=attachments,
-        rich=rich,
-        config=config,
-    )
-    # Log the reply so future calls are blocked
-    _mark_replied(message_id)
+    try:
+        send_email(
+            to=msg["from_addr"],
+            subject=msg["reply_subject"],
+            body_md=body_md,
+            in_reply_to=msg["message_id"],
+            references=msg["reply_references"],
+            from_name=from_name,
+            attachments=attachments,
+            rich=rich,
+            config=config,
+        )
+    except Exception:
+        if lock_fh:
+            try:
+                import fcntl as _fcntl
+                _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+        raise
+    _mark_replied_locked(message_id, lock_fh)
 
 
 # ---------------------------------------------------------------------------

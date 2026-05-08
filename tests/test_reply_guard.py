@@ -20,6 +20,13 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 
+def _seed_replied(waggle_mod, message_id):
+    """Test helper: directly write a Message-ID to the DB (bypasses lock)."""
+    db = waggle_mod._load_reply_db()
+    db[message_id.strip()] = datetime.datetime.now().isoformat()
+    waggle_mod._save_reply_db(db)
+
+
 # ---------------------------------------------------------------------------
 # Helpers — patch the DB path to a temp dir for each test
 # ---------------------------------------------------------------------------
@@ -51,7 +58,7 @@ def test_mark_then_check_blocked(tmp_db):
     """After _mark_replied, check_already_replied returns True."""
     import waggle
     mid = '<test-002@example.com>'
-    waggle._mark_replied(mid)
+    _seed_replied(waggle, mid)
     already, when = waggle.check_already_replied(mid)
     assert already is True
     assert when is not None
@@ -60,7 +67,7 @@ def test_mark_then_check_blocked(tmp_db):
 def test_different_message_ids_independent(tmp_db):
     """Replying to one Message-ID doesn't block another."""
     import waggle
-    waggle._mark_replied('<msg-A@example.com>')
+    _seed_replied(waggle, '<msg-A@example.com>')
     already, _ = waggle.check_already_replied('<msg-B@example.com>')
     assert already is False
 
@@ -85,10 +92,13 @@ def test_none_message_id_bypasses_guard(tmp_db):
 
 
 def test_mark_replied_empty_is_noop(tmp_db):
-    """_mark_replied('') doesn't write anything or crash."""
+    """_mark_replied_locked with empty/None mid is a no-op."""
     import waggle
-    waggle._mark_replied('')
-    assert not tmp_db.exists() or json.loads(tmp_db.read_text()) == {}
+    waggle._mark_replied_locked('', None)
+    waggle._mark_replied_locked(None, None)
+    if tmp_db.exists():
+        db = json.loads(tmp_db.read_text())
+        assert '' not in db
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +114,7 @@ def test_pruning_removes_old_entries(tmp_db):
     tmp_db.write_text(json.dumps(db))
 
     # Trigger a save (via _mark_replied on a new message)
-    waggle._mark_replied('<trigger@example.com>')
+    _seed_replied(waggle, '<trigger@example.com>')
 
     saved = json.loads(tmp_db.read_text())
     assert '<old@example.com>' not in saved
@@ -116,8 +126,8 @@ def test_pruning_keeps_recent_entries(tmp_db):
     """Entries within 30 days are kept."""
     import waggle
     mid = '<recent@example.com>'
-    waggle._mark_replied(mid)
-    waggle._mark_replied('<another@example.com>')  # trigger another save
+    _seed_replied(waggle, mid)
+    _seed_replied(waggle, '<another@example.com>')  # trigger another save
     saved = json.loads(tmp_db.read_text())
     assert mid in saved
 
@@ -150,7 +160,7 @@ def test_force_true_bypasses_guard(tmp_db, monkeypatch):
     """reply_all with force=True sends even when already replied."""
     import waggle
     mid = '<force-test@example.com>'
-    waggle._mark_replied(mid)
+    _seed_replied(waggle, mid)
 
     # Confirm it's blocked normally
     already, _ = waggle.check_already_replied(mid)
@@ -176,7 +186,7 @@ def test_force_false_raises_on_duplicate(tmp_db, monkeypatch):
     """reply_all without force=True raises RuntimeError on duplicate."""
     import waggle
     mid = '<dupe-test@example.com>'
-    waggle._mark_replied(mid)
+    _seed_replied(waggle, mid)
 
     monkeypatch.setattr(waggle, 'send_email', lambda **kw: None)
     monkeypatch.setattr(waggle, '_build_cfg', lambda c=None: {'from_addr': 'sam@example.com'})
@@ -227,12 +237,63 @@ def test_send_failure_does_not_mark_replied(tmp_db, monkeypatch):
 # Concurrency: retry loop + file lock
 # ---------------------------------------------------------------------------
 
-def test_concurrent_mark_replied_no_data_loss(tmp_db):
-    """Multiple threads marking different Message-IDs don't corrupt the DB."""
+def test_toctou_only_one_reply_sent(tmp_db, monkeypatch):
+    """
+    Two threads both see 'not replied yet' before either sends.
+    Only ONE should actually send — the second must be blocked by the
+    atomic check inside the lock.
+    """
     import waggle
 
+    sent = []
+    original_send = waggle.send_email
+
+    def fake_send(**kw):
+        sent.append(kw)
+
+    monkeypatch.setattr(waggle, 'send_email', fake_send)
+    monkeypatch.setattr(waggle, '_build_cfg', lambda c=None: {'from_addr': 'sam@example.com'})
+
+    mid = '<toctou-test@example.com>'
+    msg = {
+        'message_id': mid,
+        'from_addr': 'jason@example.com',
+        'reply_subject': 'Re: TOCTOU Test',
+        'reply_references': '',
+        'reply_cc': '',
+    }
+
+    errors = []
+
+    def try_reply():
+        try:
+            waggle.reply_all(msg, body_md='Only one should get through')
+        except RuntimeError as e:
+            errors.append(str(e))
+
+    t1 = threading.Thread(target=try_reply)
+    t2 = threading.Thread(target=try_reply)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Exactly one send, exactly one RuntimeError
+    assert len(sent) == 1, f'Expected 1 send, got {len(sent)}'
+    assert len(errors) == 1, f'Expected 1 duplicate error, got {len(errors)}'
+    assert 'Already replied' in errors[0]
+
+
+def test_concurrent_mark_replied_no_data_loss(tmp_db):
+    """Multiple threads marking different Message-IDs via full lock path don't corrupt DB."""
+    import waggle
+
+    def do_mark(mid):
+        lock_fh = waggle._acquire_reply_lock()
+        waggle._mark_replied_locked(mid, lock_fh)
+
     mids = [f'<concurrent-{i}@example.com>' for i in range(20)]
-    threads = [threading.Thread(target=waggle._mark_replied, args=(mid,)) for mid in mids]
+    threads = [threading.Thread(target=do_mark, args=(mid,)) for mid in mids]
     for t in threads:
         t.start()
     for t in threads:
@@ -261,14 +322,15 @@ def test_retry_loop_eventually_acquires(tmp_db, monkeypatch):
 
     monkeypatch.setattr(fcntl_mod, 'flock', flaky_flock)
     mid = '<retry-test@example.com>'
-    waggle._mark_replied(mid)  # should succeed on 3rd attempt
-    already, _ = waggle.check_already_replied(mid)
-    assert already is True
+    lock_fh = waggle._acquire_reply_lock()  # should succeed on 3rd attempt
+    assert lock_fh is not None
+    fcntl_mod.flock(lock_fh, fcntl_mod.LOCK_UN)
+    lock_fh.close()
     assert call_count[0] >= 3
 
 
-def test_retry_exhausted_logs_warning_and_continues(tmp_db, monkeypatch, caplog):
-    """After all retries fail, logs warning and does NOT raise."""
+def test_retry_exhausted_returns_none(tmp_db, monkeypatch, caplog):
+    """After all retries fail, _acquire_reply_lock returns None and logs warning."""
     import waggle
     import fcntl as fcntl_mod
     import logging
@@ -276,15 +338,11 @@ def test_retry_exhausted_logs_warning_and_continues(tmp_db, monkeypatch, caplog)
     def always_locked(fd, op):
         if op & fcntl_mod.LOCK_NB:
             raise BlockingIOError('always locked')
-        return fcntl_mod.flock(fd, op)  # allow LOCK_UN
 
     monkeypatch.setattr(fcntl_mod, 'flock', always_locked)
-    mid = '<exhausted-retry@example.com>'
 
     with caplog.at_level(logging.WARNING, logger='waggle.reply_guard'):
-        waggle._mark_replied(mid, _retries=3, _retry_ms=1)  # fast for tests
+        lock_fh = waggle._acquire_reply_lock(retries=3, retry_ms=1)
 
+    assert lock_fh is None
     assert any('still locked' in r.message for r in caplog.records)
-    # Should NOT be in DB since all retries failed
-    already, _ = waggle.check_already_replied(mid)
-    assert already is False
