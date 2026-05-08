@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.13"
+__version__ = "1.9.17"
 
 import html
 import os
@@ -108,6 +108,7 @@ import tempfile
 import secrets
 import html
 import json
+import fcntl
 import datetime
 from pathlib import Path
 
@@ -116,37 +117,55 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _REPLY_DB_PATH = Path.home() / '.openclaw' / 'waggle-replied.json'
+_REPLY_DB_LOCK_PATH = Path.home() / '.openclaw' / 'waggle-replied.lock'
 _REPLY_DB_MAX_DAYS = 30  # prune entries older than this
+_guard_log = logging.getLogger('waggle.reply_guard')
 
 
 def _load_reply_db():
-    """Load the replied Message-ID database."""
+    """
+    Load the replied Message-ID database.
+    Returns empty dict on any error, logging a warning so failures are visible.
+    """
     try:
         if _REPLY_DB_PATH.exists():
             return json.loads(_REPLY_DB_PATH.read_text())
-    except Exception:
-        pass
+    except json.JSONDecodeError as e:
+        _guard_log.warning(f'waggle-replied.json is corrupted ({e}) — treating as empty. Guard may miss prior replies.')
+    except Exception as e:
+        _guard_log.warning(f'Could not load waggle-replied.json: {e} — guard disabled for this call.')
     return {}
 
 
 def _save_reply_db(db):
-    """Save the replied Message-ID database, pruning old entries."""
+    """
+    Save the replied Message-ID database with atomic write + 30-day pruning.
+    Logs a warning on failure so silent guard disabling is visible.
+    """
     try:
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=_REPLY_DB_MAX_DAYS)).isoformat()
         pruned = {mid: ts for mid, ts in db.items() if ts >= cutoff}
         _REPLY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _REPLY_DB_PATH.write_text(json.dumps(pruned, indent=2))
-    except Exception:
-        pass
+        # Atomic write: write to temp file then rename so no partial writes
+        tmp = _REPLY_DB_PATH.with_suffix('.tmp')
+        tmp.write_text(json.dumps(pruned, indent=2))
+        tmp.replace(_REPLY_DB_PATH)
+    except Exception as e:
+        _guard_log.warning(f'Could not save waggle-replied.json: {e} — duplicate guard state may be lost.')
 
 
 def check_already_replied(message_id):
     """
     Check if waggle has already sent a reply to the given Message-ID.
 
+    Note: if Message-ID is empty or None, the guard is bypassed and this
+    returns (False, None). Emails without Message-IDs are rare but real;
+    the right default is to allow sending rather than block on unknowns.
+
     Returns (bool, timestamp_str_or_None)
     """
     if not message_id:
+        _guard_log.debug('check_already_replied: empty message_id — bypassing guard')
         return False, None
     db = _load_reply_db()
     mid = message_id.strip()
@@ -156,12 +175,26 @@ def check_already_replied(message_id):
 
 
 def _mark_replied(message_id):
-    """Record that we replied to this Message-ID."""
+    """
+    Record that we replied to this Message-ID.
+    Uses a file lock to prevent race conditions when two processes
+    call reply_all() simultaneously on the same message.
+    """
     if not message_id:
         return
-    db = _load_reply_db()
-    db[message_id.strip()] = datetime.datetime.now().isoformat()
-    _save_reply_db(db)
+    mid = message_id.strip()
+    try:
+        _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_REPLY_DB_LOCK_PATH, 'w') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                db = _load_reply_db()
+                db[mid] = datetime.datetime.now().isoformat()
+                _save_reply_db(db)
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception as e:
+        _guard_log.warning(f'_mark_replied failed for {mid}: {e} — duplicate guard state may be lost.')
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase

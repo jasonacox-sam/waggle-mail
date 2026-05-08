@@ -194,6 +194,36 @@ msg["reply_subject"]    # subject prefixed with "Re: "
 msg["attachments"]      # list of {filename, content_type, size}
 ```
 
+### Duplicate reply guard
+
+waggle automatically prevents sending duplicate replies to the same email. `reply_all()` and `reply()` track replied Message-IDs in `~/.openclaw/waggle-replied.json` and raise `RuntimeError` if you try to reply to the same message twice.
+
+```python
+# First reply — works normally
+reply_all(msg, body_md="Thanks for your message!")
+
+# Second reply to same message — raises RuntimeError
+try:
+    reply_all(msg, body_md="Oops, sending again")
+except RuntimeError as e:
+    print(e)  # Already replied to <msg-id> at 2026-05-07T17:19:23. Pass force=True to reply_all() if you intentionally want to send again.
+
+# Intentional re-reply — use force=True
+reply_all(msg, body_md="Follow-up", force=True)
+```
+
+You can also check programmatically before sending:
+
+```python
+from waggle import check_already_replied
+
+already, when = check_already_replied(msg["message_id"])
+if already:
+    print(f"Already replied at {when} — skipping")
+```
+
+The DB is automatically pruned to the last 30 days.
+
 ### Full reply workflow
 
 ```python
