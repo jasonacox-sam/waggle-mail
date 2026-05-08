@@ -122,6 +122,38 @@ def test_send_failure_clears_pending(tmp_db, monkeypatch):
     assert mid not in db  # pending cleared, retry allowed
 
 
+def test_reply_success(tmp_db, fake_send):
+    """reply() happy path: absent → sent."""
+    import waggle
+    mid = '<reply-001@example.com>'
+    waggle.reply(make_msg(mid), body_md='Direct reply')
+    db = json.loads(tmp_db.read_text())
+    assert db[mid].startswith('sent:')
+    assert len(fake_send) == 1
+
+
+def test_reply_duplicate_blocked(tmp_db, fake_send):
+    """reply() blocks duplicate to same Message-ID."""
+    import waggle
+    mid = '<reply-002@example.com>'
+    waggle.reply(make_msg(mid), body_md='First')
+    with pytest.raises(RuntimeError, match='Already replied'):
+        waggle.reply(make_msg(mid), body_md='Duplicate')
+    assert len(fake_send) == 1
+
+
+def test_reply_send_failure_clears_pending(tmp_db, monkeypatch):
+    """reply() send failure clears pending so retry is allowed."""
+    import waggle, smtplib
+    monkeypatch.setattr(waggle, '_build_cfg', lambda c=None: {'from_addr': 'sam@example.com'})
+    monkeypatch.setattr(waggle, 'send_email', lambda **kw: (_ for _ in ()).throw(smtplib.SMTPException('fail')))
+    mid = '<reply-003@example.com>'
+    with pytest.raises(Exception):
+        waggle.reply(make_msg(mid), body_md='Will fail')
+    db = waggle._load_reply_db()
+    assert mid not in db
+
+
 def test_different_message_ids_independent(tmp_db, fake_send):
     """Replying to one Message-ID doesn't block another."""
     import waggle

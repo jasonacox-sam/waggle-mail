@@ -2125,9 +2125,9 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
             config=config,
         )
     except Exception:
-        _abort_send_guarded(message_id, lock_fh)
+        _abort_send_guarded(message_id)
         raise
-    _confirm_send_guarded(message_id, lock_fh)
+    _confirm_send_guarded(message_id)
 
 
 # ---------------------------------------------------------------------------
