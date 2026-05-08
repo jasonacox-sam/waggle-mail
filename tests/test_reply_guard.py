@@ -224,7 +224,7 @@ def test_send_failure_does_not_mark_replied(tmp_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Concurrency: file lock prevents double-send race
+# Concurrency: retry loop + file lock
 # ---------------------------------------------------------------------------
 
 def test_concurrent_mark_replied_no_data_loss(tmp_db):
@@ -241,3 +241,50 @@ def test_concurrent_mark_replied_no_data_loss(tmp_db):
     db = json.loads(tmp_db.read_text())
     for mid in mids:
         assert mid in db, f'{mid} missing from DB after concurrent writes'
+
+
+def test_retry_loop_eventually_acquires(tmp_db, monkeypatch):
+    """Retry loop succeeds after a few BlockingIOError attempts."""
+    import waggle
+    import fcntl as fcntl_mod
+
+    call_count = [0]
+    original_flock = fcntl_mod.flock
+
+    def flaky_flock(fd, op):
+        # Fail non-blocking attempts twice, then succeed
+        if op & fcntl_mod.LOCK_NB:
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise BlockingIOError('simulated lock contention')
+        return original_flock(fd, op)
+
+    monkeypatch.setattr(fcntl_mod, 'flock', flaky_flock)
+    mid = '<retry-test@example.com>'
+    waggle._mark_replied(mid)  # should succeed on 3rd attempt
+    already, _ = waggle.check_already_replied(mid)
+    assert already is True
+    assert call_count[0] >= 3
+
+
+def test_retry_exhausted_logs_warning_and_continues(tmp_db, monkeypatch, caplog):
+    """After all retries fail, logs warning and does NOT raise."""
+    import waggle
+    import fcntl as fcntl_mod
+    import logging
+
+    def always_locked(fd, op):
+        if op & fcntl_mod.LOCK_NB:
+            raise BlockingIOError('always locked')
+        return fcntl_mod.flock(fd, op)  # allow LOCK_UN
+
+    monkeypatch.setattr(fcntl_mod, 'flock', always_locked)
+    mid = '<exhausted-retry@example.com>'
+
+    with caplog.at_level(logging.WARNING, logger='waggle.reply_guard'):
+        waggle._mark_replied(mid, _retries=3, _retry_ms=1)  # fast for tests
+
+    assert any('still locked' in r.message for r in caplog.records)
+    # Should NOT be in DB since all retries failed
+    already, _ = waggle.check_already_replied(mid)
+    assert already is False

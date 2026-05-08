@@ -174,25 +174,50 @@ def check_already_replied(message_id):
     return False, None
 
 
-def _mark_replied(message_id):
+def _mark_replied(message_id, _retries=5, _retry_ms=100):
     """
     Record that we replied to this Message-ID.
-    Uses a file lock to prevent race conditions when two processes
-    call reply_all() simultaneously on the same message.
+
+    Uses a non-blocking file lock with retry loop to handle the common case
+    where two processes (e.g. heartbeat + manual inbox check) try to reply
+    to the same email simultaneously.
+
+    Retry policy: up to _retries attempts, sleeping _retry_ms ms between
+    each. If the lock is still held after all retries, logs a warning and
+    proceeds without writing (fail-open: prefer a rare duplicate over an
+    indefinite block).
     """
     if not message_id:
         return
     mid = message_id.strip()
+    import time
     try:
         _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(_REPLY_DB_LOCK_PATH, 'w') as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            try:
-                db = _load_reply_db()
-                db[mid] = datetime.datetime.now().isoformat()
-                _save_reply_db(db)
-            finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
+        for attempt in range(1, _retries + 1):
+            with open(_REPLY_DB_LOCK_PATH, 'w') as lock_file:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        db = _load_reply_db()
+                        db[mid] = datetime.datetime.now().isoformat()
+                        _save_reply_db(db)
+                    finally:
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    return  # success
+                except BlockingIOError:
+                    if attempt < _retries:
+                        _guard_log.debug(
+                            f'Reply DB locked (attempt {attempt}/{_retries}), '
+                            f'retrying in {_retry_ms}ms...'
+                        )
+                        time.sleep(_retry_ms / 1000)
+                    else:
+                        _guard_log.warning(
+                            f'Reply DB still locked after {_retries} attempts '
+                            f'({_retries * _retry_ms}ms total). '
+                            f'Proceeding without logging {mid} — '
+                            f'duplicate guard may not fire for this message.'
+                        )
     except Exception as e:
         _guard_log.warning(f'_mark_replied failed for {mid}: {e} — duplicate guard state may be lost.')
 from email.mime.multipart import MIMEMultipart
