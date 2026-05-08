@@ -118,76 +118,75 @@ from pathlib import Path
 
 _REPLY_DB_PATH = Path.home() / '.openclaw' / 'waggle-replied.json'
 _REPLY_DB_LOCK_PATH = Path.home() / '.openclaw' / 'waggle-replied.lock'
-_REPLY_DB_MAX_DAYS = 30  # prune entries older than this
+_REPLY_DB_MAX_DAYS = 30       # prune entries older than this
+_REPLY_PENDING_TIMEOUT = 3600  # seconds before pending → retry (1 hour)
 _guard_log = logging.getLogger('waggle.reply_guard')
+
+# Prefix injected into retry sends so recipients know it may be a duplicate
+_RETRY_PREFIX = (
+    "> ⚠️ **Note:** A previous attempt to send this message encountered an error.\n"
+    "> This may be a duplicate — apologies if so.\n\n---\n\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Reply state machine
+#
+# States stored in waggle-replied.json keyed by Message-ID:
+#
+#   (absent)           — never attempted, safe to send
+#   "pending:<ts>"     — lock acquired, send in progress
+#   "sent:<ts>"        — successfully sent, permanently blocked
+#   "retry"            — pending expired (>1h), previous outcome unknown;
+#                        next send attempt will prepend _RETRY_PREFIX
+#
+# Transitions:
+#   absent   → pending  : _set_reply_state(mid, 'pending')  [under lock]
+#   pending  → sent     : _set_reply_state(mid, 'sent')     [after successful send]
+#   pending  → absent   : _clear_reply_state(mid)           [after failed send]
+#   pending  → retry    : _expire_pending_to_retry()        [hourly purge / on next read]
+#   retry    → sent     : _set_reply_state(mid, 'sent')     [after successful retry send]
+# ---------------------------------------------------------------------------
 
 
 def _load_reply_db():
-    """
-    Load the replied Message-ID database.
-    Returns empty dict on any error, logging a warning so failures are visible.
-    """
+    """Load the replied Message-ID database, logging warnings on failure."""
     try:
         if _REPLY_DB_PATH.exists():
             return json.loads(_REPLY_DB_PATH.read_text())
     except json.JSONDecodeError as e:
-        _guard_log.warning(f'waggle-replied.json is corrupted ({e}) — treating as empty. Guard may miss prior replies.')
+        _guard_log.warning(f'waggle-replied.json is corrupted ({e}) — treating as empty.')
     except Exception as e:
         _guard_log.warning(f'Could not load waggle-replied.json: {e} — guard disabled for this call.')
     return {}
 
 
 def _save_reply_db(db):
-    """
-    Save the replied Message-ID database with atomic write + 30-day pruning.
-    Logs a warning on failure so silent guard disabling is visible.
-    """
+    """Atomic write + 30-day pruning."""
     try:
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=_REPLY_DB_MAX_DAYS)).isoformat()
-        pruned = {mid: ts for mid, ts in db.items() if ts >= cutoff}
+        pruned = {}
+        for mid, state in db.items():
+            # Keep sent entries within 30 days; keep pending/retry always (they're transient)
+            if state.startswith('sent:'):
+                ts = state[5:]
+                if ts >= cutoff:
+                    pruned[mid] = state
+            else:
+                pruned[mid] = state  # pending/retry always kept (purge handles them)
         _REPLY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: write to temp file then rename so no partial writes
         tmp = _REPLY_DB_PATH.parent / (_REPLY_DB_PATH.name + '.tmp')
         tmp.write_text(json.dumps(pruned, indent=2))
         tmp.replace(_REPLY_DB_PATH)
     except Exception as e:
-        _guard_log.warning(f'Could not save waggle-replied.json: {e} — duplicate guard state may be lost.')
-
-
-def check_already_replied(message_id):
-    """
-    Check if waggle has already sent a reply to the given Message-ID.
-
-    Note: if Message-ID is empty or None, the guard is bypassed and this
-    returns (False, None). Emails without Message-IDs are rare but real;
-    the right default is to allow sending rather than block on unknowns.
-
-    This is a lock-free read for external callers (e.g. pre-flight checks).
-    Inside reply_all()/reply(), the authoritative check happens *inside* the
-    file lock to prevent TOCTOU races between concurrent processes.
-
-    Returns (bool, timestamp_str_or_None)
-    """
-    if not message_id:
-        _guard_log.debug('check_already_replied: empty message_id — bypassing guard')
-        return False, None
-    db = _load_reply_db()
-    mid = message_id.strip()
-    if mid in db:
-        return True, db[mid]
-    return False, None
+        _guard_log.warning(f'Could not save waggle-replied.json: {e} — guard state may be lost.')
 
 
 def _acquire_reply_lock(retries=5, retry_ms=100):
     """
-    Acquire the reply DB file lock with a retry loop.
-
-    Returns an open file handle with the lock held, or None if all retries
-    are exhausted. Caller must release with fcntl.flock(fh, LOCK_UN) and
-    close the handle.
-
-    Using LOCK_NB (non-blocking) + retry loop so we never block indefinitely.
-    Max wait = retries * retry_ms ms (default: 500ms).
+    Non-blocking file lock with retry loop. Max wait = retries * retry_ms ms.
+    Returns open file handle with lock held, or None if exhausted.
+    Caller must release: fcntl.flock(fh, LOCK_UN); fh.close()
     """
     import time
     _REPLY_DB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -195,20 +194,19 @@ def _acquire_reply_lock(retries=5, retry_ms=100):
         try:
             fh = open(_REPLY_DB_LOCK_PATH, 'w')
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fh  # caller holds the lock
+            return fh
         except BlockingIOError:
-            fh.close()
+            try:
+                fh.close()
+            except Exception:
+                pass
             if attempt < retries:
-                _guard_log.debug(
-                    f'Reply DB locked (attempt {attempt}/{retries}), '
-                    f'retrying in {retry_ms}ms...'
-                )
+                _guard_log.debug(f'Reply DB locked (attempt {attempt}/{retries}), retrying in {retry_ms}ms...')
                 time.sleep(retry_ms / 1000)
             else:
                 _guard_log.warning(
-                    f'Reply DB still locked after {retries} attempts '
-                    f'({retries * retry_ms}ms total). '
-                    f'Proceeding without lock — duplicate guard weakened.'
+                    f'Reply DB still locked after {retries} attempts ({retries * retry_ms}ms). '
+                    f'Proceeding without lock — duplicate guard weakened for this call.'
                 )
         except Exception as e:
             _guard_log.warning(f'Could not acquire reply lock: {e}')
@@ -216,80 +214,152 @@ def _acquire_reply_lock(retries=5, retry_ms=100):
     return None
 
 
-def _check_and_mark_replied(message_id, force=False):
+def _release_lock(lock_fh):
+    """Release a lock file handle safely."""
+    if lock_fh:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _expire_pending(db):
     """
-    Atomic check-then-mark under file lock.
+    Convert stale pending entries (> _REPLY_PENDING_TIMEOUT seconds old) to 'retry'.
+    Mutates db in place. Call while holding the lock.
+    """
+    now = datetime.datetime.now()
+    for mid, state in list(db.items()):
+        if state.startswith('pending:'):
+            try:
+                ts = datetime.datetime.fromisoformat(state[8:])
+                age = (now - ts).total_seconds()
+                if age > _REPLY_PENDING_TIMEOUT:
+                    _guard_log.warning(
+                        f'Reply to {mid} has been pending for {int(age)}s — '
+                        f'marking as retry (previous send outcome unknown).'
+                    )
+                    db[mid] = 'retry'
+            except Exception:
+                db[mid] = 'retry'  # malformed timestamp → treat as expired
 
-    This is the heart of the duplicate reply guard. By holding the lock across
-    both the check AND the write, we prevent the TOCTOU race where two
-    concurrent processes both read 'not replied yet' before either has written.
 
-    Flow (inside lock):
-      1. Re-read DB (authoritative — another process may have written since
-         the pre-flight check in reply_all())
-      2. If already replied and not force → raise RuntimeError
-      3. Otherwise send (caller handles this) → write Message-ID to DB
+def check_already_replied(message_id):
+    """
+    Check if waggle has already sent a reply to the given Message-ID.
 
-    Returns: None if safe to send (caller should send then call _mark_replied_locked)
-    Raises: RuntimeError if already replied and force=False
-    Raises: passes through any lock acquisition failure gracefully
+    Returns (bool, state_str_or_None) where state is one of:
+      'sent:<ts>'  — definitively sent
+      'pending:<ts>' — send in progress
+      'retry'      — previous attempt outcome unknown, will retry with disclaimer
+      None         — never attempted
+
+    Note: empty/None message_id bypasses the guard (returns False, None).
+    This is a lock-free read for external pre-flight checks. The authoritative
+    check happens inside the lock in _begin_send_guarded().
     """
     if not message_id:
-        return  # no Message-ID → bypass guard
+        _guard_log.debug('check_already_replied: empty message_id — bypassing guard')
+        return False, None
+    db = _load_reply_db()
+    mid = message_id.strip()
+    state = db.get(mid)
+    if state is None:
+        return False, None
+    if state == 'retry':
+        return False, 'retry'  # allowed but will get disclaimer prefix
+    return True, state
+
+
+def _begin_send_guarded(message_id, force=False):
+    """
+    Atomic guard: acquire lock, expire pending entries, check state, write 'pending'.
+
+    Returns (lock_fh, needs_retry_prefix):
+      lock_fh            — held lock (release after send + _confirm_send_guarded)
+      needs_retry_prefix — True if body should include the retry disclaimer
+
+    Raises RuntimeError if message was already sent and force=False.
+    Returns (None, False) if lock could not be acquired (fail-open with warning).
+    """
+    if not message_id:
+        return None, False
 
     mid = message_id.strip()
     lock_fh = _acquire_reply_lock()
 
     try:
-        # Authoritative re-check inside the lock
         db = _load_reply_db()
-        if mid in db and not force:
+        _expire_pending(db)  # pending → retry if >1h old
+
+        state = db.get(mid)
+
+        if state is not None and state.startswith('sent:') and not force:
             raise RuntimeError(
-                f"Already replied to message {message_id} at {db[mid]}. "
+                f"Already replied to message {message_id} (sent at {state[5:]}). "
                 f"Pass force=True to reply_all() if you intentionally want to send again."
             )
-        return lock_fh  # return held lock so caller can write after send
+
+        if state is not None and state.startswith('pending:') and not force:
+            raise RuntimeError(
+                f"Reply to message {message_id} is already in progress (since {state[8:]}). "
+                f"If this is stuck, wait 1 hour for automatic retry promotion, or pass force=True."
+            )
+
+        needs_retry_prefix = (state == 'retry')
+
+        # Mark as pending — locked under file lock so concurrent callers see it
+        db[mid] = f'pending:{datetime.datetime.now().isoformat()}'
+        _save_reply_db(db)
+        return lock_fh, needs_retry_prefix
+
     except RuntimeError:
-        # Release lock before re-raising
-        if lock_fh:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
+        _release_lock(lock_fh)
         raise
     except Exception as e:
-        if lock_fh:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
-        _guard_log.warning(f'_check_and_mark_replied error: {e}')
-        return None
+        _release_lock(lock_fh)
+        _guard_log.warning(f'_begin_send_guarded error for {mid}: {e} — proceeding unguarded.')
+        return None, False
 
 
-def _mark_replied_locked(message_id, lock_fh):
+def _confirm_send_guarded(message_id, lock_fh):
     """
-    Write Message-ID to DB and release the lock held by _check_and_mark_replied.
-    Always called after a successful send.
+    Called after a successful send. Writes 'sent:<ts>' and releases the lock.
     """
     if not message_id:
+        _release_lock(lock_fh)
         return
+    mid = message_id.strip()
     try:
-        mid = message_id.strip()
         db = _load_reply_db()
-        db[mid] = datetime.datetime.now().isoformat()
+        db[mid] = f'sent:{datetime.datetime.now().isoformat()}'
         _save_reply_db(db)
     except Exception as e:
-        _guard_log.warning(f'_mark_replied_locked failed for {message_id}: {e}')
+        _guard_log.warning(f'_confirm_send_guarded failed for {mid}: {e} — guard state may be lost.')
     finally:
-        if lock_fh:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
+        _release_lock(lock_fh)
+
+
+def _abort_send_guarded(message_id, lock_fh):
+    """
+    Called after a failed send. Clears the pending state so retries are allowed.
+    """
+    if not message_id:
+        _release_lock(lock_fh)
+        return
+    mid = message_id.strip()
+    try:
+        db = _load_reply_db()
+        if db.get(mid, '').startswith('pending:'):
+            del db[mid]
+            _save_reply_db(db)
+    except Exception as e:
+        _guard_log.warning(f'_abort_send_guarded failed for {mid}: {e}')
+    finally:
+        _release_lock(lock_fh)
+
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -1967,11 +2037,12 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         msg = read_message("42")
         reply_all(msg, body_md="Thanks for the note — here's my response.")
     """
-    # --- Duplicate reply guard (atomic: check + send + mark under lock) ---
+    # --- Duplicate reply guard: three-state atomic machine ---
+    # pending → lock held across send; sent → permanently blocked; retry → sends with disclaimer
     message_id = msg.get("message_id", "")
-    lock_fh = _check_and_mark_replied(message_id, force=force)
-    # _check_and_mark_replied raises RuntimeError if already replied (and not force)
-    # lock_fh is held until after send — prevents TOCTOU race with concurrent callers
+    lock_fh, needs_retry_prefix = _begin_send_guarded(message_id, force=force)
+    if needs_retry_prefix:
+        body_md = _RETRY_PREFIX + body_md
 
     cfg = _build_cfg(config)
     own_addr = cfg["from_addr"].strip().lower()
@@ -2004,17 +2075,9 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
             config=config,
         )
     except Exception:
-        # Send failed — release lock without writing so retries are allowed
-        if lock_fh:
-            try:
-                import fcntl as _fcntl
-                _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
+        _abort_send_guarded(message_id, lock_fh)  # clear pending, allow retry
         raise
-    # Send succeeded — write Message-ID and release lock
-    _mark_replied_locked(message_id, lock_fh)
+    _confirm_send_guarded(message_id, lock_fh)  # write sent:<ts>, release lock
 
 
 def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
@@ -2037,9 +2100,11 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         msg = read_message("42")
         reply(msg, body_md="Just between us — here's my answer.")
     """
-    # --- Duplicate reply guard (atomic: check + send + mark under lock) ---
+    # --- Duplicate reply guard: three-state atomic machine ---
     message_id = msg.get("message_id", "")
-    lock_fh = _check_and_mark_replied(message_id, force=force)
+    lock_fh, needs_retry_prefix = _begin_send_guarded(message_id, force=force)
+    if needs_retry_prefix:
+        body_md = _RETRY_PREFIX + body_md
 
     try:
         send_email(
@@ -2054,15 +2119,9 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
             config=config,
         )
     except Exception:
-        if lock_fh:
-            try:
-                import fcntl as _fcntl
-                _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
+        _abort_send_guarded(message_id, lock_fh)
         raise
-    _mark_replied_locked(message_id, lock_fh)
+    _confirm_send_guarded(message_id, lock_fh)
 
 
 # ---------------------------------------------------------------------------
