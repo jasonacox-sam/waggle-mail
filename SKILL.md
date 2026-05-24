@@ -175,6 +175,7 @@ All set via env vars (injected by openclaw.json — see Setup below):
 | `WAGGLE_IMAP_HOST` | No | `WAGGLE_HOST` | IMAP server (enables auto-reply quoting) |
 | `WAGGLE_IMAP_PORT` | No | `993` | IMAP port |
 | `WAGGLE_IMAP_TLS`  | No | `true` | IMAP SSL |
+| `WAGGLE_CONFIG` | No | — | Path to JSON config file fallback (lower precedence than explicit config/env) |
 
 ---
 

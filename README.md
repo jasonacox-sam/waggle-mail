@@ -90,6 +90,47 @@ export WAGGLE_IMAP_TLS=true
 # WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth
 ```
 
+### Optional config file fallback
+
+If you don't want to hydrate a shell with many `WAGGLE_*` variables, waggle can
+also read a JSON config file via `WAGGLE_CONFIG` or `config={"config_path": ...}`.
+This is additive and backward-compatible: explicit `config` values win, then
+environment variables, then the config file.
+
+```bash
+export WAGGLE_CONFIG=/path/to/waggle.json
+```
+
+```json
+{
+  "host": "smtp.example.com",
+  "port": 465,
+  "user": "you@example.com",
+  "password": "app-password",
+  "from_addr": "you@example.com",
+  "from_name": "Your Name",
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "imap_tls": true,
+  "tls": true,
+  "smtp_starttls": true,
+  "sent_folder": "Sent"
+}
+```
+
+Python example:
+
+```python
+from waggle import send_email
+
+send_email(
+    to="friend@example.com",
+    subject="Hello",
+    body_md="Hi",
+    config={"config_path": "/path/to/waggle.json"},
+)
+```
+
 ---
 
 ## CLI
