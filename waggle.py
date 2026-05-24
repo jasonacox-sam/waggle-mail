@@ -536,21 +536,35 @@ def _maildir_find_message(maildir_path, message_id):
 # ---------------------------------------------------------------------------
 
 def _build_cfg(config=None):
-    """Merge explicit config dict with environment variable fallbacks."""
+    """Merge explicit config dict with env vars and optional file-based fallbacks."""
     cfg = config or {}
+
+    file_cfg = {}
+    config_path = (
+        cfg.get("config_path")
+        or os.environ.get("WAGGLE_CONFIG")
+        or ""
+    )
+    if config_path:
+        try:
+            file_cfg = json.loads(Path(config_path).read_text())
+        except Exception as e:
+            logger.warning(f"Could not load WAGGLE_CONFIG file {config_path!r}: {e}")
+
     return {
-        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or os.environ.get("WAGGLE_HOST", ""),
-        "imap_port":  int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT", "993")),
-        "imap_tls":   cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", "true").lower() != "false"),
-        "user":       cfg.get("user")       or os.environ.get("WAGGLE_USER", ""),
-        "password":   cfg.get("password")   or os.environ.get("WAGGLE_PASS", ""),
-        "host":       cfg.get("host")       or os.environ.get("WAGGLE_HOST", "localhost"),
-        "port":       int(cfg.get("port")   or os.environ.get("WAGGLE_PORT", "465")),
-        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM", cfg.get("user") or os.environ.get("WAGGLE_USER", "")),
-        "from_name":  cfg.get("from_name")  or os.environ.get("WAGGLE_NAME", ""),
-        "tls":         cfg.get("tls", os.environ.get("WAGGLE_TLS", "true").lower() != "false"),
-        "smtp_starttls": cfg.get("smtp_starttls", os.environ.get("WAGGLE_SMTP_STARTTLS", "true").lower() != "false"),
-        "sent_folder":  cfg.get("sent_folder") or os.environ.get("WAGGLE_SENT_FOLDER", ""),
+        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or file_cfg.get("imap_host") or file_cfg.get("host", ""),
+        "imap_port":  int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT") or file_cfg.get("imap_port", "993")),
+        "imap_tls":   cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", str(file_cfg.get("imap_tls", "true"))).lower() != "false"),
+        "user":       cfg.get("user")       or os.environ.get("WAGGLE_USER") or file_cfg.get("user", ""),
+        "password":   cfg.get("password")   or os.environ.get("WAGGLE_PASS") or file_cfg.get("password", ""),
+        "host":       cfg.get("host")       or os.environ.get("WAGGLE_HOST") or file_cfg.get("host", "localhost"),
+        "port":       int(cfg.get("port")   or os.environ.get("WAGGLE_PORT") or file_cfg.get("port", "465")),
+        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM") or file_cfg.get("from_addr") or file_cfg.get("user") or cfg.get("user") or os.environ.get("WAGGLE_USER", ""),
+        "from_name":  cfg.get("from_name")  or os.environ.get("WAGGLE_NAME") or file_cfg.get("from_name", ""),
+        "tls":         cfg.get("tls", os.environ.get("WAGGLE_TLS", str(file_cfg.get("tls", "true"))).lower() != "false"),
+        "smtp_starttls": cfg.get("smtp_starttls", os.environ.get("WAGGLE_SMTP_STARTTLS", str(file_cfg.get("smtp_starttls", "true"))).lower() != "false"),
+        "sent_folder":  cfg.get("sent_folder") or os.environ.get("WAGGLE_SENT_FOLDER") or file_cfg.get("sent_folder", ""),
+        "config_path": config_path or cfg.get("config_path", ""),
     }
 
 
