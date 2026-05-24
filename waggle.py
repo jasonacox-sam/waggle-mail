@@ -551,15 +551,19 @@ def _build_cfg(config=None):
         except Exception as e:
             logger.warning(f"Could not load WAGGLE_CONFIG file {config_path!r}: {e}")
 
+    # Explicit cfg > env > file. For imap_host, WAGGLE_HOST is the historic
+    # env fallback when WAGGLE_IMAP_HOST is unset — preserve that behavior.
+    # For from_addr, cfg.get("user") must win over file values so that an
+    # explicit config={"user": ...} call is not overridden by a config file.
     return {
-        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or file_cfg.get("imap_host") or file_cfg.get("host", ""),
+        "imap_host":  cfg.get("imap_host")  or os.environ.get("WAGGLE_IMAP_HOST") or os.environ.get("WAGGLE_HOST") or file_cfg.get("imap_host") or file_cfg.get("host", ""),
         "imap_port":  int(cfg.get("imap_port") or os.environ.get("WAGGLE_IMAP_PORT") or file_cfg.get("imap_port", "993")),
         "imap_tls":   cfg.get("imap_tls", os.environ.get("WAGGLE_IMAP_TLS", str(file_cfg.get("imap_tls", "true"))).lower() != "false"),
         "user":       cfg.get("user")       or os.environ.get("WAGGLE_USER") or file_cfg.get("user", ""),
         "password":   cfg.get("password")   or os.environ.get("WAGGLE_PASS") or file_cfg.get("password", ""),
         "host":       cfg.get("host")       or os.environ.get("WAGGLE_HOST") or file_cfg.get("host", "localhost"),
         "port":       int(cfg.get("port")   or os.environ.get("WAGGLE_PORT") or file_cfg.get("port", "465")),
-        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM") or file_cfg.get("from_addr") or file_cfg.get("user") or cfg.get("user") or os.environ.get("WAGGLE_USER", ""),
+        "from_addr":  cfg.get("from_addr")  or os.environ.get("WAGGLE_FROM") or cfg.get("user") or os.environ.get("WAGGLE_USER") or file_cfg.get("from_addr") or file_cfg.get("user", ""),
         "from_name":  cfg.get("from_name")  or os.environ.get("WAGGLE_NAME") or file_cfg.get("from_name", ""),
         "tls":         cfg.get("tls", os.environ.get("WAGGLE_TLS", str(file_cfg.get("tls", "true"))).lower() != "false"),
         "smtp_starttls": cfg.get("smtp_starttls", os.environ.get("WAGGLE_SMTP_STARTTLS", str(file_cfg.get("smtp_starttls", "true"))).lower() != "false"),

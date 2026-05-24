@@ -49,6 +49,35 @@ def test_build_cfg_reads_optional_config_file(tmp_path, monkeypatch):
     assert cfg["sent_folder"] == "Sent Items"
 
 
+def test_build_cfg_waggle_host_fallback_for_imap(monkeypatch):
+    """WAGGLE_HOST must remain the env fallback for imap_host when WAGGLE_IMAP_HOST is unset."""
+    monkeypatch.setenv("WAGGLE_HOST", "mail.example.com")
+    monkeypatch.delenv("WAGGLE_IMAP_HOST", raising=False)
+    monkeypatch.delenv("WAGGLE_CONFIG", raising=False)
+
+    cfg = waggle._build_cfg()
+
+    assert cfg["imap_host"] == "mail.example.com"
+
+
+def test_build_cfg_explicit_user_not_overridden_by_file(tmp_path, monkeypatch):
+    """Explicit config={'user': ...} must win over from_addr/user in the config file."""
+    cfg_path = tmp_path / "waggle.json"
+    cfg_path.write_text(json.dumps({
+        "host": "smtp.example.com",
+        "user": "file@example.com",
+        "password": "secret",
+        "from_addr": "file@example.com",
+    }))
+
+    monkeypatch.delenv("WAGGLE_FROM", raising=False)
+    monkeypatch.delenv("WAGGLE_USER", raising=False)
+
+    cfg = waggle._build_cfg({"config_path": str(cfg_path), "user": "explicit@example.com"})
+
+    assert cfg["from_addr"] == "explicit@example.com"
+
+
 def test_build_cfg_env_overrides_file(tmp_path, monkeypatch):
     cfg_path = tmp_path / "waggle.json"
     cfg_path.write_text(json.dumps({
