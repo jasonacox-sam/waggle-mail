@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.19"
+__version__ = "1.9.20"
 
 import html
 import os
@@ -2262,10 +2262,26 @@ def _cli_attach(args):
 
 
 def _cli_send(args):
+    import sys as _sys
+    # Resolve body: --body > --body-file > stdin
+    body_file = getattr(args, "body_file", None)
+    if args.body is not None:
+        body_md = args.body
+    elif body_file is not None:
+        if body_file == "-":
+            body_md = _sys.stdin.read()
+        else:
+            with open(body_file, "r", encoding="utf-8") as _f:
+                body_md = _f.read()
+    elif not _sys.stdin.isatty():
+        body_md = _sys.stdin.read()
+    else:
+        print("error: one of --body, --body-file, or stdin is required", file=_sys.stderr)
+        _sys.exit(1)
     send_email(
         to=args.to,
         subject=args.subject,
-        body_md=args.body,
+        body_md=body_md,
         cc=args.cc,
         reply_to=getattr(args, "reply_to", None),
         in_reply_to=getattr(args, "in_reply_to", None),
@@ -2328,7 +2344,9 @@ def main():
     p_send = sub.add_parser("send", help="Send an email")
     p_send.add_argument("--to",          required=True)
     p_send.add_argument("--subject",     required=True)
-    p_send.add_argument("--body",        required=True, help="Markdown body")
+    p_send.add_argument("--body",        default=None, help="Markdown body (inline)")
+    p_send.add_argument("--body-file",   default=None, metavar="FILE",
+                        help="Read body from file path ('-' for stdin)")
     p_send.add_argument("--cc",          default=None)
     p_send.add_argument("--reply-to",    default=None)
     p_send.add_argument("--from-name",   default=None)
