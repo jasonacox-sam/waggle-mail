@@ -180,6 +180,26 @@ waggle send \
   --body "# Hi\n\nThis is **markdown** and it works for both humans and AI agents."
 ```
 
+#### Body input options
+
+The Markdown body can come from any of three sources (resolved in this order):
+
+```bash
+# 1. Inline with --body
+waggle send --to "friend@example.com" --subject "Hi" --body "# Hello"
+
+# 2. From a file with --body-file
+waggle send --to "friend@example.com" --subject "Hi" --body-file letter.md
+
+# 3. Piped in on stdin — pass '-' to --body-file, or just pipe with no body flag
+cat letter.md | waggle send --to "friend@example.com" --subject "Hi" --body-file -
+generate-report | waggle send --to "friend@example.com" --subject "Daily report"
+```
+
+Reading from a file or stdin keeps large or multi-line bodies out of your shell
+history and argument list — handy for AI agents piping generated Markdown
+straight into a message.
+
 ### Reply with auto-quoted thread
 
 ```bash
