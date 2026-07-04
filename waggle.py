@@ -902,6 +902,49 @@ def list_inbox(folder="INBOX", limit=20, config=None):
             pass
 
 
+def count_unread(folder="INBOX", config=None):
+    """
+    Count unread (\\Unseen) messages in a folder.
+
+    Uses a single IMAP ``UID SEARCH UNSEEN`` — it never fetches message bodies,
+    so it is cheap enough for cron/heartbeat polling. Opens the folder read-only.
+
+    Args:
+        folder: IMAP folder name (default: INBOX)
+        config: Optional config dict (falls back to env vars)
+
+    Returns:
+        int: number of unread messages (0 if the folder is empty of unread mail).
+
+    Raises:
+        ValueError:   folder name fails validation (control chars / injection).
+        RuntimeError: IMAP not configured, folder cannot be selected, or the
+                      server returns a non-OK search status.
+    """
+    cfg = _build_cfg(config)
+    m, _ = _imap_connect(cfg)
+    if m is None:
+        raise RuntimeError("IMAP not configured — set WAGGLE_IMAP_HOST")
+
+    try:
+        _validate_folder_name(folder)
+        status, _ = m.select(_imap_quote_folder(folder), readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Could not select folder: {folder!r}")
+
+        status, data = m.uid("SEARCH", None, "UNSEEN")
+        if status != "OK":
+            raise RuntimeError(f"UNSEEN search failed for folder: {folder!r}")
+        if not data or not data[0]:
+            return 0
+        return len(data[0].split())
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
 def read_message(uid, folder="INBOX", mark_read=False, config=None):
     """
     Read a full email message by IMAP UID.
@@ -2180,6 +2223,21 @@ def _cli_list(args):
         print(f"{m['uid']:<6} {unread:<7} {frm:<30} {subj:<45} {date}")
 
 
+def _cli_check(args):
+    """Cron-native unread check. Exit 0 if unread present, 1 if none, 2 on error."""
+    import sys as _sys
+    try:
+        n = count_unread(folder=args.folder)
+    except Exception as e:
+        print(f"error: {e}", file=_sys.stderr)
+        _sys.exit(2)
+    if getattr(args, "json", False):
+        print(json.dumps({"folder": args.folder, "unread": n}))
+    else:
+        print(f"{n} unread in {args.folder}")
+    _sys.exit(0 if n > 0 else 1)
+
+
 def _cli_read(args):
     msg = read_message(args.uid, folder=args.folder, mark_read=getattr(args, 'mark_read', False))
     print("=" * 70)
@@ -2311,6 +2369,15 @@ def main():
     p_list.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_list.add_argument("--limit",  type=int, default=20, help="Max messages (default: 20)")
 
+    # --- check ---
+    p_check = sub.add_parser(
+        "check",
+        help="Check for unread mail (cron exit codes: 0=unread, 1=none, 2=error)",
+    )
+    p_check.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+    p_check.add_argument("--json", action="store_true", default=False,
+                         help="Emit JSON ({\"folder\":..., \"unread\":N}) instead of text")
+
     # --- read ---
     p_read = sub.add_parser("read", help="Read a message (body + threading headers)")
     p_read.add_argument("uid", help="IMAP UID (from waggle list or waggle search)")
@@ -2362,6 +2429,7 @@ def main():
 
     dispatch = {
         "list":   _cli_list,
+        "check":  _cli_check,
         "read":   _cli_read,
         "move":   _cli_move,
         "attach": _cli_attach,
