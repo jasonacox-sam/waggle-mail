@@ -1703,6 +1703,15 @@ def _md_to_html_simple(text):
     text = re.sub(r"```(\w*)\n(.*?)```", _extract_fence, text, flags=re.DOTALL)
     html = _escape_html(text)
 
+    html = re.sub(r"^###### (.+)$",
+        r'<h6 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:11pt;margin:12px 0 4px 0;">\1</h6>\n',
+        html, flags=re.MULTILINE)
+    html = re.sub(r"^##### (.+)$",
+        r'<h5 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:12pt;margin:14px 0 4px 0;">\1</h5>\n',
+        html, flags=re.MULTILINE)
+    html = re.sub(r"^#### (.+)$",
+        r'<h4 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:13pt;margin:14px 0 4px 0;">\1</h4>\n',
+        html, flags=re.MULTILINE)
     html = re.sub(r"^### (.+)$",
         r'<h3 style="font-family:Aptos,Calibri,Arial,sans-serif;font-size:14pt;margin:16px 0 4px 0;">\1</h3>\n',
         html, flags=re.MULTILINE)
