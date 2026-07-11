@@ -428,9 +428,12 @@ def _build_references(in_reply_to, references):
     Returns the References header value (possibly an empty string).
     """
     refs = references.split() if references else []
-    if in_reply_to and in_reply_to not in refs:
+    if in_reply_to:
         refs.append(in_reply_to)
-    return " ".join(refs)
+    # dict.fromkeys() dedups while preserving first-seen order — the chain must
+    # stay in order (RFC 5322), and this makes the preservation intent explicit
+    # while also collapsing any duplicates already present in a messy parent chain.
+    return " ".join(dict.fromkeys(refs))
 
 
 def _validate_email(addr):

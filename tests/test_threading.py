@@ -28,6 +28,12 @@ def test_references_preserved_without_in_reply_to():
     assert waggle._build_references(None, "<a@x> <b@x>") == "<a@x> <b@x>"
 
 
+def test_duplicates_in_parent_chain_collapse_in_order():
+    # A messy multi-hop parent chain with a repeated id collapses to first-seen
+    # order — the chain stays valid without reordering.
+    assert waggle._build_references("<c@x>", "<a@x> <b@x> <a@x>") == "<a@x> <b@x> <c@x>"
+
+
 def test_empty_when_nothing_provided():
     assert waggle._build_references(None, None) == ""
 
