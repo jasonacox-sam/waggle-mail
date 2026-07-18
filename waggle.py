@@ -415,6 +415,27 @@ def _sanitize_header(value):
     return value
 
 
+def _build_references(in_reply_to, references):
+    """Build the References header for a reply (RFC 5322 §3.6.4).
+
+    A reply's References chain is the parent's References plus the parent's
+    own Message-ID. We derive it here so the thread can't orphan when a caller
+    passes in_reply_to without a complete references chain: Gmail and most
+    modern clients thread on References, not In-Reply-To, so a missing or
+    partial chain silently splits the conversation. A message that forgets who
+    its parents are is the whole bug — carry the chain, don't rewrite it.
+
+    Returns the References header value (possibly an empty string).
+    """
+    refs = references.split() if references else []
+    if in_reply_to:
+        refs.append(in_reply_to)
+    # dict.fromkeys() dedups while preserving first-seen order — the chain must
+    # stay in order (RFC 5322), and this makes the preservation intent explicit
+    # while also collapsing any duplicates already present in a messy parent chain.
+    return " ".join(dict.fromkeys(refs))
+
+
 def _validate_email(addr):
     if not addr:
         return None
@@ -2051,8 +2072,10 @@ def send_email(
         msg["Reply-To"]    = reply_to
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
+    # Derive the full References chain so a reply can't orphan (see _build_references).
+    references = _build_references(in_reply_to, references)
     if references:
-        msg["References"]  = references
+        msg["References"] = references
 
     ctx = ssl.create_default_context()
     if cfg["tls"]:
