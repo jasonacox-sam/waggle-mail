@@ -401,6 +401,14 @@ _UTF8_QP.body_encoding = QP
 
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class DuplicateSendError(RuntimeError):
+    """Raised by send_email() when dedup_minutes > 0 and a recent identical send is detected."""
+
+
+# ---------------------------------------------------------------------------
 # Security: Header sanitization
 # ---------------------------------------------------------------------------
 
@@ -1978,6 +1986,7 @@ def send_email(
     config=None,
     save_sent=True,
     sent_folder=None,
+    dedup_minutes: int = 0,
 ):
     """
     Send a multipart email rendered from Markdown.
@@ -2000,16 +2009,27 @@ def send_email(
                       "Georgia, serif"). Defaults to "Aptos, Calibri, Arial, sans-serif".
                       Only used when rich=True.
         config:       Config dict (falls back to env vars).
-        save_sent:    If True (default), append sent message to IMAP Sent folder.
-                      Silently skips if IMAP is not configured.
-        sent_folder:  Explicit IMAP Sent folder name, or None for auto-detect.
-                      Auto-detection order: "Sent", "Sent Items", "INBOX.Sent".
+        save_sent:      If True (default), append sent message to IMAP Sent folder.
+                        Silently skips if IMAP is not configured.
+        sent_folder:    Explicit IMAP Sent folder name, or None for auto-detect.
+                        Auto-detection order: "Sent", "Sent Items", "INBOX.Sent".
+        dedup_minutes:  If > 0, check the local send log before sending. Raises
+                        DuplicateSendError if the same (to, subject) was sent within
+                        this many minutes. Default 0 (disabled). Useful for agent
+                        loops where a retry might fire before the first send confirms.
     """
     if not isinstance(save_sent, bool):
         raise TypeError(f"save_sent must be bool, got {type(save_sent).__name__}")
     if sent_folder is not None and not isinstance(sent_folder, str):
         raise TypeError(f"sent_folder must be str or None, got {type(sent_folder).__name__}")
     cfg = _build_cfg(config)
+
+    if dedup_minutes and check_recently_sent(to, subject, within_minutes=dedup_minutes):
+        raise DuplicateSendError(
+            f"Duplicate send suppressed: to={to!r} subject={subject!r} "
+            f"within the last {dedup_minutes} minute(s). "
+            "Pass dedup_minutes=0 to override."
+        )
 
     quoted_plain = quoted_html = None
     if in_reply_to:
