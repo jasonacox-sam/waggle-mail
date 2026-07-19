@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.21"
+__version__ = "1.9.22"
 
 import html
 import os
