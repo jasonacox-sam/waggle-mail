@@ -1988,6 +1988,7 @@ def send_email(
     save_sent=True,
     sent_folder=None,
     dedup_minutes: int = 0,
+    skip_quote_fetch: bool = False,
 ):
     """
     Send a multipart email rendered from Markdown.
@@ -2018,11 +2019,20 @@ def send_email(
                         DuplicateSendError if the same (to, subject) was sent within
                         this many minutes. Default 0 (disabled). Useful for agent
                         loops where a retry might fire before the first send confirms.
+        skip_quote_fetch: If True, skip the fetch_quoted_body() IMAP search even when
+                        in_reply_to is set — threading headers (In-Reply-To/References)
+                        are still applied. For callers that already fetched the original
+                        message (e.g. by UID via read_message()) and built their own quote
+                        block, this avoids a redundant Message-ID search — one that fails
+                        silently on providers like AWS WorkMail. Default False (unchanged
+                        behavior).
     """
     if not isinstance(save_sent, bool):
         raise TypeError(f"save_sent must be bool, got {type(save_sent).__name__}")
     if sent_folder is not None and not isinstance(sent_folder, str):
         raise TypeError(f"sent_folder must be str or None, got {type(sent_folder).__name__}")
+    if not isinstance(skip_quote_fetch, bool):
+        raise TypeError(f"skip_quote_fetch must be bool, got {type(skip_quote_fetch).__name__}")
     cfg = _build_cfg(config)
 
     if dedup_minutes and check_recently_sent(to, subject, within_minutes=dedup_minutes):
@@ -2033,7 +2043,7 @@ def send_email(
         )
 
     quoted_plain = quoted_html = None
-    if in_reply_to:
+    if in_reply_to and not skip_quote_fetch:
         quoted_plain, quoted_html = fetch_quoted_body(in_reply_to, config=cfg)
 
     subject     = _sanitize_header(subject)
