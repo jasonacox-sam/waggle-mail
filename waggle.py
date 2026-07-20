@@ -2273,6 +2273,9 @@ def _fmt_size(n):
 
 def _cli_list(args):
     msgs = list_inbox(folder=args.folder, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps({"folder": args.folder, "messages": msgs}))
+        return
     if not msgs:
         print(f"(no messages in {args.folder})")
         return
@@ -2303,6 +2306,9 @@ def _cli_check(args):
 
 def _cli_read(args):
     msg = read_message(args.uid, folder=args.folder, mark_read=getattr(args, 'mark_read', False))
+    if getattr(args, "json", False):
+        print(json.dumps(msg))
+        return
     print("=" * 70)
     print(f"From:    {msg['from_raw']}")
     print(f"To:      {msg['to']}")
@@ -2352,6 +2358,9 @@ def _cli_search(args):
         query["unseen"] = True
 
     msgs = search_messages(query, folders=folders, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps({"query": query, "folders": folders, "messages": msgs}))
+        return
     if not msgs:
         print("(no messages found)")
         return
@@ -2368,12 +2377,18 @@ def _cli_search(args):
 
 def _cli_move(args):
     move_message(args.uid, args.dest, src_folder=args.folder)
+    if getattr(args, "json", False):
+        print(json.dumps({"uid": args.uid, "from": args.folder, "to": args.dest, "status": "moved"}))
+        return
     print(f"✅ Moved {args.uid} from {args.folder} → {args.dest}")
 
 
 def _cli_attach(args):
     dest = args.dest or "./attachments"
     paths = download_attachments(args.uid, folder=args.folder, dest_dir=dest)
+    if getattr(args, "json", False):
+        print(json.dumps({"uid": args.uid, "dest": dest, "paths": [str(p) for p in paths]}))
+        return
     if paths:
         print(f"✅ Downloaded {len(paths)} attachment(s) to {dest}:")
         for p in paths:
@@ -2431,6 +2446,8 @@ def main():
     p_list = sub.add_parser("list", help="List inbox envelopes")
     p_list.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_list.add_argument("--limit",  type=int, default=20, help="Max messages (default: 20)")
+    p_list.add_argument("--json", action="store_true", default=False,
+                        help="Emit JSON ({\"folder\":..., \"messages\":[...]}) instead of a table")
 
     # --- check ---
     p_check = sub.add_parser(
@@ -2447,12 +2464,16 @@ def main():
     p_read.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_read.add_argument("--mark-read", action="store_true", default=False,
                         help="Mark message as read (\\Seen) on the server")
+    p_read.add_argument("--json", action="store_true", default=False,
+                        help="Emit the full message dict as JSON instead of formatted text")
 
     # --- move ---
     p_move = sub.add_parser("move", help="Move a message to another folder")
     p_move.add_argument("uid",  help="IMAP UID (from waggle list or waggle search)")
     p_move.add_argument("dest", help="Destination folder (e.g. INBOX.Processed)")
     p_move.add_argument("--folder", default="INBOX", help="Source folder (default: INBOX)")
+    p_move.add_argument("--json", action="store_true", default=False,
+                        help="Emit JSON confirmation instead of text")
 
     # --- search ---
     p_srch = sub.add_parser("search", help="Search messages across folders (returns folder+UID together)")
@@ -2463,12 +2484,16 @@ def main():
     p_srch.add_argument("--unseen",  action="store_true", default=False, help="Only unread messages")
     p_srch.add_argument("--folders", default=None, help="Comma-separated folder list (default: INBOX,INBOX.Processed)")
     p_srch.add_argument("--limit",   type=int, default=20, help="Max results per folder (default: 20)")
+    p_srch.add_argument("--json", action="store_true", default=False,
+                        help="Emit JSON ({\"messages\":[...]}) instead of a table")
 
     # --- attach ---
     p_att = sub.add_parser("attach", help="Download attachments from a message")
     p_att.add_argument("uid", help="IMAP UID (from waggle list or waggle search)")
     p_att.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
     p_att.add_argument("--dest",   default="./attachments", help="Destination directory")
+    p_att.add_argument("--json", action="store_true", default=False,
+                       help="Emit JSON ({\"paths\":[...]}) instead of text")
 
     # --- send ---
     p_send = sub.add_parser("send", help="Send an email")
