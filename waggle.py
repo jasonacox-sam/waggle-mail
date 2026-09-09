@@ -377,7 +377,7 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 from email.charset import Charset, QP
-from email.utils import parseaddr, formataddr, getaddresses
+from email.utils import parseaddr, formataddr, getaddresses, make_msgid
 from urllib.parse import urlparse
 
 # Security: Size limits for attachment downloads
@@ -2015,6 +2015,7 @@ def send_email(
     sent_folder=None,
     dedup_minutes: int = 0,
     skip_quote_fetch: bool = False,
+    message_id: str = None,
 ):
     """
     Send a multipart email rendered from Markdown.
@@ -2052,6 +2053,14 @@ def send_email(
                         block, this avoids a redundant Message-ID search — one that fails
                         silently on providers like AWS WorkMail. Default False (unchanged
                         behavior).
+        message_id:  Optional RFC 5322 Message-ID to assert for this message. When None
+                     (default), waggle mints one locally via make_msgid() using the
+                     From domain. The id is set on the outgoing message (so the IMAP
+                     Sent copy is self-identifying) and returned to the caller.
+
+    Returns the message's Message-ID (string). Previously this function returned
+    None; the return value is knowable before the send completes because waggle
+    asserts the id locally rather than relying on the MTA to mint one.
     """
     if not isinstance(save_sent, bool):
         raise TypeError(f"save_sent must be bool, got {type(save_sent).__name__}")
@@ -2130,6 +2139,13 @@ def send_email(
     msg["Subject"] = subject
     msg["From"]    = from_header
     msg["To"]      = to
+    # Assert a Message-ID locally (RFC 5322): the sender owns the id before the
+    # send completes, and the IMAP Sent copy becomes self-identifying. MTAs
+    # (incl. SES) only mint their own when the field is absent. See issue #37.
+    if not message_id:
+        from_domain = cfg["from_addr"].split("@", 1)[1] if "@" in cfg["from_addr"] else "local"
+        message_id = make_msgid(domain=from_domain)
+    msg["Message-ID"] = _sanitize_header(message_id)
     if cc:
         msg["Cc"] = cc
         for addr in cc.split(","):
@@ -2169,6 +2185,8 @@ def send_email(
 
     # Log the send so check_recently_sent() can detect duplicates
     _log_sent(to, subject)
+
+    return message_id
 
 
 def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
@@ -2223,7 +2241,7 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
     refs = re.sub(r'[\r\n]+\s*', ' ', msg.get("reply_references", "") or "").strip()
 
     try:
-        send_email(
+        result = send_email(
             to=msg["from_addr"],
             subject=msg["reply_subject"],
             body_md=body_md,
@@ -2239,6 +2257,7 @@ def reply_all(msg, body_md, *, from_name=None, attachments=None, rich=False, con
         _abort_send_guarded(message_id)  # clear pending, allow retry
         raise
     _confirm_send_guarded(message_id)  # write sent:<ts>
+    return result
 
 
 def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=None, force=False):
@@ -2268,7 +2287,7 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         body_md = _RETRY_PREFIX + body_md
 
     try:
-        send_email(
+        result = send_email(
             to=msg["from_addr"],
             subject=msg["reply_subject"],
             body_md=body_md,
@@ -2283,6 +2302,7 @@ def reply(msg, body_md, *, from_name=None, attachments=None, rich=False, config=
         _abort_send_guarded(message_id)
         raise
     _confirm_send_guarded(message_id)
+    return result
 
 
 # ---------------------------------------------------------------------------
