@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.26"
+__version__ = "1.9.27"
 
 import html
 import os
@@ -109,6 +109,7 @@ import secrets
 import html
 import json
 import fcntl
+from collections import namedtuple
 import datetime
 from pathlib import Path
 
@@ -1997,6 +1998,60 @@ def _md_to_plain(text):
 # Public: send_email (unchanged API from v1.1)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SMTP receipt capture (issue #39)
+#
+# smtplib.SMTP.sendmail() calls (code, resp) = self.data(msg) and then discards
+# the tuple — the provider's final 250 accept line (e.g. the SES-minted id and
+# its timestamp) never reaches the caller. These subclasses intercept data()
+# and stash the reply so send_email(return_receipt=True) can return it.
+# ---------------------------------------------------------------------------
+
+class _ReceiptSMTP(smtplib.SMTP):
+    """SMTP that records the final DATA-phase reply."""
+
+    last_data_reply = None  # (code, response) from the final 250 accept
+
+    def data(self, msg):
+        reply = super().data(msg)
+        self.last_data_reply = reply
+        return reply
+
+
+class _ReceiptSMTP_SSL(smtplib.SMTP_SSL, _ReceiptSMTP):
+    """SMTP_SSL that records the final DATA-phase reply."""
+
+
+SendReceipt = namedtuple(
+    "SendReceipt", ["message_id", "smtp_code", "smtp_response"]
+)
+
+
+def _provider_id_from_response(response):
+    """Parse the provider-minted message id out of an SMTP 250 accept line.
+
+    SES replies like: "0100018a087de6661-xxxxx-0000-0000-0000-0000-amazonses.com Ok"
+    Other providers may embed the id in angle brackets or not at all. Returns
+    None when no recognizable id is present.
+    """
+    if not response:
+        return None
+    m = re.search(r"<([^>]+)>", response)
+    if m:
+        return m.group(1)
+    # SES-style bare id: long local part @ amazonses.com
+    m = re.search(r"([\w.-]+@[\w.-]*amazonses[\w.-]*)", response)
+    if m:
+        return m.group(1)
+    return None
+
+
+# Make provider_id available on the namedtuple for convenience.
+SendReceipt.provider_id = property(
+    lambda self: _provider_id_from_response(self.smtp_response)
+)
+
+
 def send_email(
     to,
     subject,
@@ -2016,6 +2071,7 @@ def send_email(
     dedup_minutes: int = 0,
     skip_quote_fetch: bool = False,
     message_id: str = None,
+    return_receipt: bool = False,
 ):
     """
     Send a multipart email rendered from Markdown.
@@ -2041,6 +2097,17 @@ def send_email(
         save_sent:      If True (default), append sent message to IMAP Sent folder.
                         Silently skips if IMAP is not configured.
         sent_folder:    Explicit IMAP Sent folder name, or None for auto-detect.
+
+    return_receipt:  If True, return a SendReceipt namedtuple (message_id first,
+                    so tuple-unpacking callers keep working) carrying the raw SMTP
+                    accept line alongside the locally-minted id:
+                      SendReceipt(message_id, smtp_code, smtp_response)
+                    smtp_response is the provider's final 250 reply (e.g. the SES
+                    accept line containing the provider-minted id). provider_id
+                    attribute parses the id out of angle brackets when present.
+                    Default False — send_email() returns the message_id string as
+                    before. See issue #39: assertion (local mint) and receipt
+                    (transport acceptance) are different guarantees.
                         Auto-detection order: "Sent", "Sent Items", "INBOX.Sent".
         dedup_minutes:  If > 0, check the local send log before sending. Raises
                         DuplicateSendError if the same (to, subject) was sent within
@@ -2160,13 +2227,17 @@ def send_email(
         msg["References"] = references
 
     ctx = ssl.create_default_context()
+    receipt_reply = None
     if cfg["tls"]:
-        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx) as s:
+        smtp_cls = _ReceiptSMTP_SSL if return_receipt else smtplib.SMTP_SSL
+        with smtp_cls(cfg["host"], cfg["port"], context=ctx) as s:
             if cfg["user"] and cfg["password"]:
                 s.login(cfg["user"], cfg["password"])
             s.sendmail(envelope_from, envelope_to, msg.as_string())
+            receipt_reply = getattr(s, "last_data_reply", None)
     else:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as s:
+        smtp_cls = _ReceiptSMTP if return_receipt else smtplib.SMTP
+        with smtp_cls(cfg["host"], cfg["port"]) as s:
             s.ehlo()
             if cfg.get("smtp_starttls", True) and s.has_extn("STARTTLS"):
                 s.starttls(context=ctx)
@@ -2174,6 +2245,7 @@ def send_email(
             if cfg["user"] and cfg["password"]:
                 s.login(cfg["user"], cfg["password"])
             s.sendmail(envelope_from, envelope_to, msg.as_string())
+            receipt_reply = getattr(s, "last_data_reply", None)
 
     # IMAP Sent folder sync — save sent message server-side
     if save_sent and cfg.get("imap_host"):
@@ -2186,6 +2258,9 @@ def send_email(
     # Log the send so check_recently_sent() can detect duplicates
     _log_sent(to, subject)
 
+    if return_receipt:
+        code, response = (receipt_reply if receipt_reply else (None, None))
+        return SendReceipt(message_id=message_id, smtp_code=code, smtp_response=response)
     return message_id
 
 
