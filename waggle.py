@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.27"
+__version__ = "1.9.28"
 
 import html
 import os
@@ -380,6 +380,19 @@ from email import encoders
 from email.charset import Charset, QP
 from email.utils import parseaddr, formataddr, getaddresses, make_msgid
 from urllib.parse import urlparse
+
+
+# Python 3.12.6+ made getaddresses() strict by default. A single unusual but
+# deliverable mailbox in a long To/Cc list can then cause the parser to return
+# only ("", ""), silently collapsing reply-all to the first surviving header.
+# Received mail is messy; parse it permissively here, then rely on Waggle's
+# outbound address validation before anything is sent.
+def _getaddresses_for_reply(fields):
+    try:
+        return getaddresses(fields, strict=False)
+    except TypeError:  # Python versions before the strict= parameter
+        return getaddresses(fields)
+
 
 # Security: Size limits for attachment downloads
 MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50MB per file
@@ -832,7 +845,7 @@ def _parse_message(raw_bytes):
     _all_recipients = []
     for field in (to, cc):
         if field:
-            for name_part, addr_part in getaddresses([field]):
+            for name_part, addr_part in _getaddresses_for_reply([field]):
                 addr_part = addr_part.strip().lower()
                 if addr_part and addr_part != from_addr_p.lower():
                     _all_recipients.append(addr_part)
