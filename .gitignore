@@ -37,3 +37,12 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# OpenClaw workspace scaffold (seeded if a session cwd lands in this clone)
+/AGENTS.md
+/SOUL.md
+/USER.md
+/TOOLS.md
+/IDENTITY.md
+/HEARTBEAT.md
+/.openclaw/
