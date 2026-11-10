@@ -91,7 +91,7 @@ Configuration (environment variables):
                      WAGGLE_USER / WAGGLE_PASS are reused for IMAP auth.
 """
 
-__version__ = "1.9.28"
+__version__ = "1.9.29"
 
 import html
 import os
@@ -99,6 +99,7 @@ import re
 import ssl
 import imaplib
 import email as email_lib
+from email import policy
 from email.header import decode_header, make_header
 import smtplib
 import argparse
@@ -392,6 +393,24 @@ def _getaddresses_for_reply(fields):
         return getaddresses(fields, strict=False)
     except TypeError:  # Python versions before the strict= parameter
         return getaddresses(fields)
+
+
+def _header_addresses_for_reply(msg, header_name):
+    """Return addr-spec values from a structured address header.
+
+    HeaderRegistry correctly preserves quoted display names that contain a
+    comma and are folded across physical lines (a common Outlook shape).
+    Fall back to the permissive legacy parser for older/message-like objects.
+    """
+    addresses = []
+    for field in msg.get_all(header_name, []):
+        structured = getattr(field, "addresses", None)
+        if structured is not None:
+            addresses.extend(addr.addr_spec for addr in structured if addr.addr_spec)
+        else:
+            decoded = _decode_header_str(field)
+            addresses.extend(addr for _, addr in _getaddresses_for_reply([decoded]) if addr)
+    return addresses
 
 
 # Security: Size limits for attachment downloads
@@ -777,7 +796,7 @@ def _parse_message(raw_bytes):
     Keys: message_id, references, in_reply_to, from_addr, from_name,
           to, subject, date, body_plain, body_html, attachments (list of dicts)
     """
-    msg = email_lib.message_from_bytes(raw_bytes)
+    msg = email_lib.message_from_bytes(raw_bytes, policy=policy.default)
 
     message_id  = _decode_header_str(msg.get("Message-ID", "")).strip()
     references  = _decode_header_str(msg.get("References", "")).strip()
@@ -843,12 +862,11 @@ def _parse_message(raw_bytes):
     # Build reply_cc: everyone on To + Cc except the original sender (they go in To)
     # Caller should also remove their own address before sending.
     _all_recipients = []
-    for field in (to, cc):
-        if field:
-            for name_part, addr_part in _getaddresses_for_reply([field]):
-                addr_part = addr_part.strip().lower()
-                if addr_part and addr_part != from_addr_p.lower():
-                    _all_recipients.append(addr_part)
+    for header_name in ("To", "Cc"):
+        for addr_part in _header_addresses_for_reply(msg, header_name):
+            addr_part = addr_part.strip().lower()
+            if addr_part and addr_part != from_addr_p.lower():
+                _all_recipients.append(addr_part)
     # Deduplicate while preserving order
     _seen = set()
     reply_cc_list = []

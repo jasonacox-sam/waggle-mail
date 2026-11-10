@@ -46,3 +46,28 @@ def test_reply_cc_excludes_sender_and_deduplicates():
     parsed = waggle._parse_message(msg.as_bytes())
 
     assert parsed["reply_cc"] == "sam@example.com, other@example.com"
+
+
+def test_reply_cc_keeps_folded_last_first_display_name():
+    """Outlook may fold a quoted ``Last, First`` display name mid-name."""
+    raw = (
+        b"From: George Will <george@example.com>\r\n"
+        b"To: Jason <jason@example.com>, Sam <sam@example.com>, \"Selvaraj,\r\n"
+        b" Varun\" <varun@example.com>\r\n"
+        b"Cc: Herman <herman@example.com>, Mandeep <mandeep@example.com>\r\n"
+        b"Subject: Folded recipient\r\n"
+        b"Message-ID: <folded-recipient@example.com>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Body\r\n"
+    )
+
+    parsed = waggle._parse_message(raw)
+
+    assert parsed["reply_cc"].split(", ") == [
+        "jason@example.com",
+        "sam@example.com",
+        "varun@example.com",
+        "herman@example.com",
+        "mandeep@example.com",
+    ]
